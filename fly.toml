@@ -1,0 +1,22 @@
+# Fly.io app config for the TouchLine backend.
+# Deploy: flyctl launch --no-deploy (first time, to generate app name) then `flyctl deploy`
+
+app = "touchline-api"          # change to whatever's available; flyctl will prompt
+primary_region = "iad"         # pick the region closest to your players
+
+[build]
+
+[env]
+  PORT = "8080"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = false   # WebSocket connections don't survive a cold stop mid-match
+  auto_start_machines = true
+  min_machines_running = 1
+
+[[vm]]
+  cpu_kind = "shared"
+  cpus = 1
+  memory_mb = 512

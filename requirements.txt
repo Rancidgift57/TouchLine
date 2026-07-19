@@ -1,0 +1,16 @@
+fastapi>=0.111
+uvicorn[standard]>=0.30
+websockets>=12.0
+libsql-client>=0.3.1
+numpy>=1.26
+scipy>=1.13
+python-dotenv>=1.0
+
+# ML (engine/ml_bridge.py, ml/*_architecture.py) — the engine degrades to
+# pure rule-based/Gaussian mode if these aren't installed, but install them
+# to get the trained xG + decision nets in the loop.
+torch>=2.2
+scikit-learn>=1.4
+joblib>=1.3
+pandas>=2.2
+statsbombpy>=1.14   # only needed to RE-train the models from scratch
