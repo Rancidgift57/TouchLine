@@ -345,3 +345,13 @@ pin down one canonical frontend URL first.
 - A disconnected friend-match player's socket dropping doesn't currently
   pause or forfeit the match — the simulation keeps running server-side for
   whoever's still connected.
+
+---
+
+## Contact
+- Email: nnair7598@gmail.com
+- LinkedIn: https://www.linkedin.com/in/nikhil-nair-809248286
+
+---
+
+**Thank You**
