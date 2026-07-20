@@ -465,6 +465,7 @@ async def _try_kickoff(lobby: _Lobby) -> bool:
         try:
             await side_obj.ws.send_json({
                 "type": "kickoff", "match_id": result["match_id"],
+                "home_team_id": result["home_team_id"], "away_team_id": result["away_team_id"],
                 "home_player_map": result["home_player_map"], "away_player_map": result["away_player_map"],
                 "your_side": side_name, "your_token": side_token,
             })
@@ -897,3 +898,212 @@ def replay_with_substitution(
             apply_substitution(team, player_out_id, player_in)
             applied = True
     return events
+
+
+# ---------------------------------------------------------------------------
+# Live trading between two connected managers.
+#
+# The pieces to SETTLE a trade already existed (db/turso_client.execute_trade
+# is a full ACID multi-table swap, engine/market_ml.score_trade is the
+# fairness/anti-cheat check) but nothing in this file ever actually created
+# an offer or exposed any of it over HTTP/WebSocket — index.html's Trade Hub
+# was purely a client-side mock negotiating against a fake seeded inbox, not
+# two real managers. This section is the missing wiring:
+#   * POST /trade/propose, /trade/{id}/counter, /trade/{id}/accept,
+#     /trade/{id}/decline — the negotiation state machine.
+#   * GET  /trade/box/{team_id} — a plain poll fallback (works even if the
+#     WebSocket below is unavailable/blocked by a restrictive network).
+#   * WS   /ws/trades/{team_id} — a live push channel so BOTH sides see a
+#     propose/counter/accept land in real time instead of waiting on a
+#     manual refresh, mirroring the friend-match lobby's pattern of one
+#     shared, subscribable channel per room (here: per team).
+# ---------------------------------------------------------------------------
+
+from engine.market_ml import PlayerValuationInput, TradeLeg, predict_value, score_trade
+from db.turso_client import (
+    create_trade_offer, respond_to_trade_offer, get_trade_offer_detail,
+    list_team_trade_offers, TradeRejected,
+)
+
+_TRADE_SUBSCRIBERS: dict[str, list[asyncio.Queue]] = {}  # team_id -> live listeners
+
+
+async def _broadcast_trade_event(team_ids: list[str], payload: dict) -> None:
+    """Pushes to every connected /ws/trades/{team_id} listener for each
+    team involved — both the proposer and the receiver get it instantly,
+    whichever one didn't trigger the action."""
+    for team_id in set(team_ids):
+        for q in list(_TRADE_SUBSCRIBERS.get(team_id, [])):
+            await q.put(payload)
+
+
+class TradeOfferLeg(BaseModel):
+    player_id: str
+    age: int
+    overall: int
+    potential: int
+    contract_years_left: int
+    current_form: float = 0.0
+
+
+class TradeClause(BaseModel):
+    player_id: str
+    clause_type: str  # 'buyback' | 'sell_on'
+    buyback_fee: int | None = None
+    buyback_expires_season: int | None = None
+    sell_on_percentage: float | None = None
+
+
+class TradeProposeRequest(BaseModel):
+    from_team_id: str
+    to_team_id: str
+    players_offered: list[TradeOfferLeg] = []      # proposer -> receiver
+    players_requested: list[TradeOfferLeg] = []    # receiver -> proposer
+    cash_from_proposer: int = 0
+    cash_from_receiver: int = 0
+    clauses: list[TradeClause] = []
+
+
+def _score_offer(req: "TradeProposeRequest"):
+    """Values every player leg with the same market model the frontend's
+    fairness meter mirrors client-side, then scores the whole package —
+    this is the actual anti-cheat check, not just a UI preview."""
+    from_side = [
+        TradeLeg(player_value=predict_value(PlayerValuationInput(
+            age=p.age, overall=p.overall, potential=p.potential,
+            contract_years_left=p.contract_years_left, current_form=p.current_form,
+        )))
+        for p in req.players_offered
+    ] + ([TradeLeg(player_value=0, cash=req.cash_from_proposer)] if req.cash_from_proposer else [])
+    to_side = [
+        TradeLeg(player_value=predict_value(PlayerValuationInput(
+            age=p.age, overall=p.overall, potential=p.potential,
+            contract_years_left=p.contract_years_left, current_form=p.current_form,
+        )))
+        for p in req.players_requested
+    ] + ([TradeLeg(player_value=0, cash=req.cash_from_receiver)] if req.cash_from_receiver else [])
+    return score_trade(from_side, to_side)
+
+
+@app.post("/trade/propose")
+async def propose_trade(req: TradeProposeRequest) -> dict:
+    fairness = _score_offer(req)
+    if fairness.flag == "blocked":
+        return JSONResponse(status_code=422, content={
+            "error": "Blocked by the valuation model — this trade is too lopsided.",
+            "fairness_score": fairness.fairness_score, "flag": fairness.flag,
+        })
+
+    offer_id = await create_trade_offer(
+        from_team_id=req.from_team_id, to_team_id=req.to_team_id,
+        players_to_receiving_team=[p.player_id for p in req.players_offered],
+        players_to_proposing_team=[p.player_id for p in req.players_requested],
+        from_team_cash=req.cash_from_proposer, to_team_cash=req.cash_from_receiver,
+        ml_fairness_score=fairness.fairness_score, ml_flag=fairness.flag,
+        clauses=[c.model_dump() for c in req.clauses],
+    )
+    detail = await get_trade_offer_detail(offer_id)
+    await _broadcast_trade_event([req.from_team_id, req.to_team_id],
+                                  {"type": "trade_proposed", "offer": detail})
+    return detail
+
+
+@app.post("/trade/{offer_id}/counter")
+async def counter_trade(offer_id: str, req: TradeProposeRequest) -> dict:
+    """Same shape as /trade/propose — a counter-offer is a brand-new offer
+    with the sides typically flipped, linked back via parent_offer_id."""
+    fairness = _score_offer(req)
+    if fairness.flag == "blocked":
+        return JSONResponse(status_code=422, content={
+            "error": "Blocked by the valuation model — this counter is too lopsided.",
+            "fairness_score": fairness.fairness_score, "flag": fairness.flag,
+        })
+
+    new_offer_id = await create_trade_offer(
+        from_team_id=req.from_team_id, to_team_id=req.to_team_id,
+        players_to_receiving_team=[p.player_id for p in req.players_offered],
+        players_to_proposing_team=[p.player_id for p in req.players_requested],
+        from_team_cash=req.cash_from_proposer, to_team_cash=req.cash_from_receiver,
+        ml_fairness_score=fairness.fairness_score, ml_flag=fairness.flag,
+        clauses=[c.model_dump() for c in req.clauses],
+        parent_offer_id=offer_id,
+    )
+    detail = await get_trade_offer_detail(new_offer_id)
+    await _broadcast_trade_event([req.from_team_id, req.to_team_id],
+                                  {"type": "trade_countered", "original_offer_id": offer_id, "offer": detail})
+    return detail
+
+
+@app.post("/trade/{offer_id}/accept")
+async def accept_trade(offer_id: str) -> dict:
+    detail = await get_trade_offer_detail(offer_id)
+    if detail is None:
+        return JSONResponse(status_code=404, content={"error": "Offer not found."})
+    try:
+        settlement = await respond_to_trade_offer(offer_id, "accept")
+    except TradeRejected as e:
+        return JSONResponse(status_code=409, content={"error": str(e)})
+    await _broadcast_trade_event([detail["from_team_id"], detail["to_team_id"]],
+                                  {"type": "trade_accepted", "offer_id": offer_id, "settlement": settlement})
+    return settlement
+
+
+@app.post("/trade/{offer_id}/decline")
+async def decline_trade(offer_id: str) -> dict:
+    detail = await get_trade_offer_detail(offer_id)
+    if detail is None:
+        return JSONResponse(status_code=404, content={"error": "Offer not found."})
+    result = await respond_to_trade_offer(offer_id, "decline")
+    await _broadcast_trade_event([detail["from_team_id"], detail["to_team_id"]],
+                                  {"type": "trade_declined", "offer_id": offer_id})
+    return result
+
+
+@app.get("/team/{team_id}/roster")
+async def team_roster(team_id: str) -> dict:
+    """Read-only squad listing for building a trade offer. The friend-match
+    tactical map deliberately only shows the opponent's placeholder dots
+    (see README's "Known limitations"), but a live trade needs to know
+    what they actually have — this exposes just enough (name/position/
+    overall/valuation inputs) to build an offer against, not full match
+    internals like consistency/fatigue/current stat rolls."""
+    client = get_client()
+    rs = await client.execute(
+        "SELECT p.id, p.name, p.position, p.overall, p.age, p.potential, "
+        "p.contract_years_left, p.current_form, pr.squad_role "
+        "FROM player_rights pr JOIN players p ON p.id = pr.player_id "
+        "WHERE pr.owner_team_id = ? ORDER BY p.overall DESC",
+        [team_id],
+    )
+    return {"team_id": team_id, "players": [dict(r) for r in rs.rows]}
+
+
+@app.get("/trade/box/{team_id}")
+async def trade_box(team_id: str) -> dict:
+    """Poll-based fallback — open offers (inbox + outbox combined, the
+    frontend splits by from_team_id/to_team_id) for a team. Works even for
+    a client that never opens the WebSocket below."""
+    offers = await list_team_trade_offers(team_id)
+    return {"team_id": team_id, "offers": offers}
+
+
+@app.websocket("/ws/trades/{team_id}")
+async def trade_socket(websocket: WebSocket, team_id: str):
+    """Live push companion to the REST routes above: whenever a propose/
+    counter/accept/decline touches this team on either side, it's pushed
+    here immediately, so two managers who are both online see the
+    negotiation update in real time instead of polling /trade/box."""
+    await websocket.accept()
+    q: asyncio.Queue = asyncio.Queue()
+    _TRADE_SUBSCRIBERS.setdefault(team_id, []).append(q)
+    try:
+        # Send current open offers immediately on connect, same idea as
+        # stream_match()'s event-replay-for-late-joiners.
+        await websocket.send_json({"type": "snapshot", "offers": await list_team_trade_offers(team_id)})
+        while True:
+            payload = await q.get()
+            await websocket.send_json(payload)
+    except WebSocketDisconnect:
+        pass
+    finally:
+        _TRADE_SUBSCRIBERS.get(team_id, []).remove(q) if q in _TRADE_SUBSCRIBERS.get(team_id, []) else None

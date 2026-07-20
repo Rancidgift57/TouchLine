@@ -97,6 +97,19 @@ that, via `engine/ml_bridge.py`:
 If `torch` or the `.pth` weight files aren't available, the engine degrades
 gracefully to pure rule-based/Gaussian mode automatically — no crash.
 
+**Tactics feed the ML layer, not just the Gaussian one.** The trained nets
+only ever see shot geometry (position/angle/pressure) — on their own they
+have no way to notice a manager pushed the mentality dial mid-match.
+`ml_bridge.decide()` now takes the attacking team's live `mentality` and
+blends a tilt into the trained decision probabilities (attacking shifts
+mass toward Shot, defensive shifts it toward Pass), and `match_engine.py`
+applies mentality as a genuine two-sided trade-off rather than a one-sided
+bonus: it raises your own chance-creation rate when you're on the front
+foot, but also raises the *opponent's* chance rate against you (thinner
+defensive line), and stiffens/softens the individual creation duel via the
+defending side's effective positioning stat. A mentality of 0 reproduces
+the model's untouched output.
+
 Substitutions are **not cosmetic**: `apply_substitution()` mutates a
 `TeamSnapshot.lineup` in place, and `simulate_match` re-reads
 `team.outfield()`/`goalkeeper()` fresh every minute, so any caller holding
@@ -105,6 +118,18 @@ simulated ahead of time in a batch job (no one watching live),
 `api/match_stream.replay_with_substitution()` re-runs the same RNG seed and
 applies the sub at the requested minute — byte-for-byte identical up to that
 point, genuinely different after.
+
+---
+
+## Offline demo pacing
+
+Playing solo without a live backend runs `index.html`'s self-contained
+`simTick()` loop instead of the WebSocket streamer. Its per-minute delay is
+the `SIM_TICK_MS` constant (1100ms), tuned so 90 ticks plus the 20s
+half-time pause land on ~2 real minutes — matching what the live backend
+(`SECONDS_PER_GAME_MINUTE` in `api/match_stream.py`) already delivers for a
+real match. (This used to be hardcoded at 260ms, worth calling out since it
+made the whole 90-minute match blow by in under 30 real seconds.)
 
 ---
 
@@ -165,6 +190,34 @@ borderline chances than a human would call, which is a reasonable trade-off
 for an engine that's aiming for watchable matches, but worth knowing if
 you're tuning `ml_bridge.py`'s decision threshold — pulling it toward Pass
 would trade away some of that shot recall for cleaner precision.
+
+---
+
+## Live Trade (real two-player trading)
+
+`engine/market_ml.py`'s fairness scoring and `db/turso_client.py`'s ACID
+`execute_trade()` existed from the start, but nothing used to expose them —
+the Transfer Market tab only ever negotiated against a synthetic, client-
+seeded inbox, so two real managers could never actually trade. That's now
+wired end-to-end for the two-player **friend match** flow (trading needs a
+real opposing `team_id`, which only exists once both sides are in a live
+match together — see "Known limitations" below):
+
+- `POST /trade/propose`, `/trade/{id}/counter`, `/trade/{id}/accept`,
+  `/trade/{id}/decline` — the negotiation state machine, each one
+  re-running `score_trade()` server-side so the fairness/anti-cheat check
+  can't be bypassed by a tampered client.
+- `GET /trade/box/{team_id}` — poll fallback.
+- `WS /ws/trades/{team_id}` — live push so both managers see a propose/
+  counter/accept land instantly, mirroring the friend-match lobby's
+  one-shared-channel pattern.
+- `GET /team/{team_id}/roster` — lets your browser see what the opponent's
+  *real* squad actually has (name/position/overall/valuation inputs only,
+  not full match internals), since the tactical map itself only shows
+  their side as placeholder dots.
+
+In the Match Centre, once a friend match is live, a **🔁 Live Trade**
+button appears next to the mentality/substitution controls.
 
 ---
 
@@ -345,13 +398,3 @@ pin down one canonical frontend URL first.
 - A disconnected friend-match player's socket dropping doesn't currently
   pause or forfeit the match — the simulation keeps running server-side for
   whoever's still connected.
-
----
-
-## Contact
-- Email: nnair7598@gmail.com
-- LinkedIn: https://www.linkedin.com/in/nikhil-nair-809248286
-
----
-
-**Thank You**

@@ -167,6 +167,155 @@ async def execute_trade(offer_id: str) -> dict[str, Any]:
     }
 
 
+async def create_trade_offer(
+    from_team_id: str,
+    to_team_id: str,
+    players_to_receiving_team: list[str],
+    players_to_proposing_team: list[str],
+    from_team_cash: int,
+    to_team_cash: int,
+    ml_fairness_score: float,
+    ml_flag: str,
+    clauses: list[dict[str, Any]] | None = None,
+    expires_in_hours: float = 48.0,
+    parent_offer_id: str | None = None,
+) -> str:
+    """
+    Inserts a brand-new trade offer (or, when `parent_offer_id` is set, a
+    counter-offer — same shape, just linked back to what it's countering).
+    Mirrors `propose_counter_offer` below but is also usable for the very
+    first offer in a negotiation, and takes the full set of legs/cash/
+    clauses in one call instead of expecting the caller to know the table
+    layout. `ml_fairness_score`/`ml_flag` are computed by the caller via
+    `engine/market_ml.score_trade()` BEFORE this is called, so a 'blocked'
+    offer can be rejected before it ever touches the database.
+
+    `clauses` is a list of {"player_id", "clause_type" ('buyback'|
+    'sell_on'), "buyback_fee", "buyback_expires_season", "sell_on_percentage"}.
+    """
+    client = get_client()
+    offer_id = str(uuid.uuid4())
+    now = datetime.now(timezone.utc)
+    expires_at = now.timestamp() + expires_in_hours * 3600
+
+    statements = [
+        libsql_client.Statement(
+            "INSERT INTO trade_offers (id, from_team_id, to_team_id, parent_offer_id, status, "
+            "ml_fairness_score, ml_flag, expires_at) VALUES (?, ?, ?, ?, 'proposed', ?, ?, ?)",
+            [offer_id, from_team_id, to_team_id, parent_offer_id, ml_fairness_score, ml_flag,
+             datetime.fromtimestamp(expires_at, tz=timezone.utc).isoformat()],
+        ),
+    ]
+    if parent_offer_id:
+        statements.append(libsql_client.Statement(
+            "UPDATE trade_offers SET status = 'countered', resolved_at = ? WHERE id = ?",
+            [now.isoformat(), parent_offer_id],
+        ))
+    for player_id in players_to_receiving_team:
+        statements.append(libsql_client.Statement(
+            "INSERT INTO trade_offer_players (offer_id, player_id, direction) VALUES (?, ?, 'to_receiving_team')",
+            [offer_id, player_id],
+        ))
+    for player_id in players_to_proposing_team:
+        statements.append(libsql_client.Statement(
+            "INSERT INTO trade_offer_players (offer_id, player_id, direction) VALUES (?, ?, 'to_proposing_team')",
+            [offer_id, player_id],
+        ))
+    if from_team_cash or to_team_cash:
+        statements.append(libsql_client.Statement(
+            "INSERT INTO trade_offer_cash (offer_id, from_team_cash, to_team_cash) VALUES (?, ?, ?)",
+            [offer_id, from_team_cash, to_team_cash],
+        ))
+    for clause in clauses or []:
+        statements.append(libsql_client.Statement(
+            "INSERT INTO trade_offer_clauses (offer_id, player_id, clause_type, buyback_fee, "
+            "buyback_expires_season, sell_on_percentage) VALUES (?, ?, ?, ?, ?, ?)",
+            [offer_id, clause["player_id"], clause["clause_type"], clause.get("buyback_fee"),
+             clause.get("buyback_expires_season"), clause.get("sell_on_percentage")],
+        ))
+
+    await client.batch(statements)
+    return offer_id
+
+
+async def respond_to_trade_offer(offer_id: str, action: str) -> dict[str, Any]:
+    """
+    The RECEIVING side's response to a live offer: 'accept' settles it
+    immediately via `execute_trade` (ACID), 'decline' just closes it out.
+    Kept separate from `execute_trade` itself so a caller (the trade API
+    route) can go straight from "the other manager just clicked Accept" to
+    a settled trade in one call.
+    """
+    if action == "decline":
+        client = get_client()
+        now = datetime.now(timezone.utc).isoformat()
+        await client.execute(
+            "UPDATE trade_offers SET status = 'rejected', resolved_at = ? WHERE id = ? AND status = 'proposed'",
+            [now, offer_id],
+        )
+        return {"offer_id": offer_id, "status": "rejected"}
+    if action == "accept":
+        client = get_client()
+        now = datetime.now(timezone.utc).isoformat()
+        # execute_trade() requires status='accepted' already (it's also the
+        # entry point for a batch/offline settlement flow) -- flip it here
+        # first, inside the same "the receiving side just said yes" call.
+        rs = await client.execute(
+            "UPDATE trade_offers SET status = 'accepted' WHERE id = ? AND status = 'proposed' RETURNING id",
+            [offer_id],
+        )
+        if not rs.rows:
+            raise TradeRejected(f"Offer {offer_id} is not in a state that can be accepted")
+        return await execute_trade(offer_id)
+    raise ValueError(f"Unknown trade response action: {action!r}")
+
+
+async def get_trade_offer_detail(offer_id: str) -> dict[str, Any] | None:
+    """Full offer detail (legs, cash, clauses) for pushing over the live
+    trade WebSocket or returning from a REST call."""
+    client = get_client()
+    offer_rs = await client.execute(
+        "SELECT id, from_team_id, to_team_id, parent_offer_id, status, ml_fairness_score, "
+        "ml_flag, created_at, expires_at, resolved_at FROM trade_offers WHERE id = ?",
+        [offer_id],
+    )
+    if not offer_rs.rows:
+        return None
+    offer = dict(offer_rs.rows[0])
+
+    players_rs = await client.execute(
+        "SELECT p.id, p.name, p.position, p.overall, top.direction "
+        "FROM trade_offer_players top JOIN players p ON p.id = top.player_id WHERE top.offer_id = ?",
+        [offer_id],
+    )
+    offer["players"] = [dict(r) for r in players_rs.rows]
+
+    cash_rs = await client.execute(
+        "SELECT from_team_cash, to_team_cash FROM trade_offer_cash WHERE offer_id = ?", [offer_id]
+    )
+    offer["cash"] = dict(cash_rs.rows[0]) if cash_rs.rows else {"from_team_cash": 0, "to_team_cash": 0}
+
+    clauses_rs = await client.execute(
+        "SELECT player_id, clause_type, buyback_fee, buyback_expires_season, sell_on_percentage "
+        "FROM trade_offer_clauses WHERE offer_id = ?", [offer_id]
+    )
+    offer["clauses"] = [dict(r) for r in clauses_rs.rows]
+    return offer
+
+
+async def list_team_trade_offers(team_id: str) -> list[dict[str, Any]]:
+    """Inbox + outbox in one shot — open ('proposed') offers where this
+    team is on either side, newest first."""
+    client = get_client()
+    rs = await client.execute(
+        "SELECT id, from_team_id, to_team_id, status, ml_fairness_score, ml_flag, created_at "
+        "FROM trade_offers WHERE (from_team_id = ? OR to_team_id = ?) AND status = 'proposed' "
+        "ORDER BY created_at DESC",
+        [team_id, team_id],
+    )
+    return [dict(r) for r in rs.rows]
+
+
 async def propose_counter_offer(original_offer_id: str, new_offer_payload: dict[str, Any]) -> str:
     """Marks the original offer 'countered' and inserts a new linked offer row."""
     client = get_client()

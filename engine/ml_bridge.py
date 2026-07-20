@@ -185,8 +185,24 @@ class MLBridge:
         return np.array([[row[c] for c in XG_FEATURES]])
 
     # -- public API ---------------------------------------------------------
-    def decide(self, ctx: PitchContext) -> tuple[str, dict[str, float]]:
-        """Returns (chosen_action, {'Pass':p,'Dribble':p,'Shot':p})."""
+    def decide(self, ctx: PitchContext, mentality: float = 0.0) -> tuple[str, dict[str, float]]:
+        """Returns (chosen_action, {'Pass':p,'Dribble':p,'Shot':p}).
+
+        `mentality` is the attacking team's tactical dial, -1 (ultra-
+        defensive) .. +1 (all-out attack). The trained net was fit on
+        StatsBomb event data and only ever sees pitch geometry — it has no
+        idea a manager just pushed the mentality slider mid-match, so on
+        its own a tactic change would be invisible to the decision model.
+        Rather than retraining a net to add a feature dimension, this
+        blends a small, deterministic tilt into the trained probabilities
+        post-hoc: attacking mentality shifts mass from Pass toward Shot
+        (more first-time efforts, less patient buildup); defensive
+        mentality shifts it back the other way (keep the ball, wait for a
+        clean look). The geometry-driven shape of the distribution — e.g.
+        "close to goal favors Shot regardless" — still comes entirely from
+        the trained net; mentality only nudges it, and mentality=0
+        reproduces the model's raw output exactly.
+        """
         if not self.available:
             # Deterministic-ish fallback so callers never branch on
             # `.available` themselves: favors passing, more shots near goal.
@@ -200,6 +216,13 @@ class MLBridge:
                 logits = self.decision_model(tensor)
                 probs = torch.softmax(logits, dim=1).numpy()[0]
 
+        m = max(-1.0, min(1.0, mentality))
+        if m != 0.0:
+            # [Pass, Dribble, Shot] tilt, scaled by mentality; renormalize.
+            tilt = np.array([-0.14, -0.02, 0.16]) * m
+            probs = np.clip(probs + tilt, 1e-4, None)
+            probs = probs / probs.sum()
+
         actions = ["Pass", "Dribble", "Shot"]
         chosen = np.random.choice(actions, p=probs)
         return chosen, dict(zip(actions, (float(p) for p in probs)))
@@ -210,7 +233,12 @@ class MLBridge:
             # Simple geometric fallback: closer + more central -> higher.
             d = ctx.distance_to_goal
             a = ctx.angle_to_goal
-            return float(np.clip(0.5 * np.exp(-d / 22) * np.cos(a) ** 1.5, 0.01, 0.9))
+            # cos(a) can go negative once the angle exceeds 90 degrees (e.g.
+            # x > 120, behind the goal line — never happens in real shot
+            # data, but this fallback has to handle it without producing
+            # NaN from a fractional power of a negative number).
+            angle_factor = max(0.0, float(np.cos(a))) ** 1.5
+            return float(np.clip(0.5 * np.exp(-d / 22) * angle_factor, 0.01, 0.9))
 
         vec = self.xg_scaler.transform(self._xg_vector(ctx))
         tensor = torch.tensor(vec, dtype=torch.float32)

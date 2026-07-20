@@ -337,8 +337,15 @@ def simulate_match(
         # home.outfield()/away.outfield() FRESH every minute, so a
         # substitution applied mid-generator (apply_substitution) takes
         # effect on the very next iteration — no precomputation to undo.
-        home_strength = sum(p.overall for p in home.outfield()) + state.momentum.value * 40
-        away_strength = sum(p.overall for p in away.outfield()) - state.momentum.value * 40
+        # Mentality feeds possession/territory too, not just chance creation
+        # below: an attacking team pushes numbers forward and dictates more
+        # of the game, a defensive team sits in and sees less of the ball.
+        # It's still a trade-off, not a free stat boost — the defensive
+        # cost of an attacking mentality shows up in `defender_stat` a few
+        # lines down, where the *other* team's attackers face a thinner
+        # defensive line.
+        home_strength = sum(p.overall for p in home.outfield()) + state.momentum.value * 40 + home.mentality * 12
+        away_strength = sum(p.overall for p in away.outfield()) - state.momentum.value * 40 + away.mentality * 12
         p_home_has_ball = home_strength / (home_strength + away_strength)
         attacking_home = rng.random() < p_home_has_ball
 
@@ -363,9 +370,18 @@ def simulate_match(
                    "momentum": round(state.momentum.value, 3),
                    "break_seconds": half_time_break_seconds}
 
-        # Roughly one clear "event" (chance/chaos/nothing) every few minutes,
-        # scaled slightly by attacking mentality.
-        chance_probability = 0.11 + max(0.0, attacking_team.mentality) * 0.05
+        # Roughly one clear "event" (chance/chaos/nothing) every few minutes.
+        # Tactics move this in two independent, opposing directions:
+        #  * the ATTACKING team's own mentality creates more clear-cut
+        #    moments when they're on the front foot (only the positive half
+        #    counts — playing defensively doesn't stop you from creating
+        #    chances on the break, it just doesn't add extra ones).
+        #  * the DEFENDING team's mentality matters too: sitting deep and
+        #    compact (negative mentality) chokes off supply; pushing up
+        #    aggressively (positive mentality) leaves more space in behind,
+        #    so it raises the chance probability *against* them.
+        chance_probability = 0.11 + max(0.0, attacking_team.mentality) * 0.05 + defending_team.mentality * 0.04
+        chance_probability = max(0.03, min(0.30, chance_probability))
         if rng.random() >= chance_probability:
             continue  # quiet minute, no event emitted (frontend just ticks the clock)
 
@@ -376,10 +392,17 @@ def simulate_match(
         attacker_pos = _jitter_position(rng, _slot_position(attacker.position, attacking_home), 14, 18)
         defender_pos = _jitter_position(rng, _slot_position(defender.position, not attacking_home), 8, 10)
 
+        # A defensive mentality also stiffens the individual duel, not just
+        # the odds of it happening at all (organized deep block = harder to
+        # beat one-on-one); an attacking/high-line mentality softens it
+        # (space in behind, less cover). +/-6 points at the mentality
+        # extremes — comparable in size to a single momentum swing.
+        defender_stat = defender.positioning - defending_team.mentality * 6
+
         # --- Duel 1: creating the chance (Vision/Positioning vs defender's Positioning)
         creation = resolve_duel(
             rng, attacker, defender,
-            attacker_stat=attacker.vision, defender_stat=defender.positioning,
+            attacker_stat=attacker.vision, defender_stat=defender_stat,
             momentum=state.momentum, attacker_is_home=attacking_home,
         )
 
@@ -390,7 +413,7 @@ def simulate_match(
         # or does the attacker recycle possession (pass/dribble instead)?
         ctx_x, ctx_y = attacker_pos if attacking_home else (120 - attacker_pos[0], attacker_pos[1])
         pitch_ctx = PitchContext(x=ctx_x, y=ctx_y, under_pressure=not creation["chaos"])
-        decision, decision_probs = bridge.decide(pitch_ctx)
+        decision, decision_probs = bridge.decide(pitch_ctx, mentality=attacking_team.mentality)
 
         ml_xg = bridge.xg(pitch_ctx)
         xg_value = round((rng.uniform(0.03, 0.42) + ml_xg) / 2, 3)

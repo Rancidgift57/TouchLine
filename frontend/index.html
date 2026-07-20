@@ -809,6 +809,7 @@ button{font-family:var(--font-body);cursor:pointer;}
           <button class="btn btn-primary btn-sm" id="sim-start-btn">Kick off simulation</button>
           <button class="btn btn-ghost btn-sm" id="mentality-btn">Push mentality: attacking</button>
           <button class="btn btn-ghost btn-sm" id="sub-btn">Make a substitution</button>
+          <button class="btn btn-ghost btn-sm" id="live-trade-btn" style="display:none;">🔁 Live Trade <span id="live-trade-badge" style="display:none;"></span></button>
           <span class="subs-counter" id="subs-counter">Subs: 0/5</span>
           <span class="subs-counter" id="live-mode-badge" style="display:none;"></span>
         </div>
@@ -886,19 +887,20 @@ function liveWsBase(){ return LIVE_API_BASE ? LIVE_API_BASE.replace(/^http/, 'ws
    anywhere in this UI. */
 const DIVISIONS = ['Continental Premier', 'Riverside Championship'];
 const CLUBS = [
-  {id:'RMA', name:'Real Madrid',   division:0, color:'#E8A33D', color2:'#C1443C'},
-  {id:'FCB', name:'FC Barcelona',   division:0, color:'#4C8FB0', color2:'#0C2B20'},
-  {id:'MAN', name:'Manchester Utd', division:0, color:'#C1443C', color2:'#1B4E3A'},
-  {id:'LIV', name:'Liverpool',   division:0, color:'#7CC77E', color2:'#0C2B20'},
-  {id:'MNC', name:'Manchester City',  division:0, color:'#B98BD6', color2:'#1B4E3A'},
-  {id:'BYM', name:'Bayern Munich',    division:0, color:'#8A9BA8', color2:'#0C2B20'},
-  {id:'MSG', name:'Mohun Bagan Super Giant',    division:1, color:'#D9724B', color2:'#0C2B20'},
-  {id:'KBFC', name:'Kerala Blasters FC',  division:1, color:'#5FB3D9', color2:'#1B4E3A'},
-  {id:'BFC', name:'Bengaluru FC',     division:1, color:'#E0C24A', color2:'#0C2B20'},
-  {id:'MFC', name:'Mumbai City FC',   division:1, color:'#6BBF6B', color2:'#1B4E3A'},
-  {id:'CFC', name:'Chelsea FC',  division:1, color:'#9A6BD9', color2:'#0C2B20'},
-  {id:'AFC', name:'Arsenal FC', division:1, color:'#C97A3D', color2:'#1B4E3A'},
+  {id:'ARS', name:'Arsenal Row',   division:0, color:'#E8A33D', color2:'#C1443C'},
+  {id:'MER', name:'Meridian FC',   division:0, color:'#4C8FB0', color2:'#0C2B20'},
+  {id:'FOR', name:'Forgewell Utd', division:0, color:'#C1443C', color2:'#1B4E3A'},
+  {id:'HAR', name:'Harbourside',   division:0, color:'#7CC77E', color2:'#0C2B20'},
+  {id:'DUS', name:'Dusklight SC',  division:0, color:'#B98BD6', color2:'#1B4E3A'},
+  {id:'IRO', name:'Ironbridge',    division:0, color:'#8A9BA8', color2:'#0C2B20'},
+  {id:'CAL', name:'Calderdown',    division:1, color:'#D9724B', color2:'#0C2B20'},
+  {id:'NTH', name:'Northgate FC',  division:1, color:'#5FB3D9', color2:'#1B4E3A'},
+  {id:'STV', name:'Stavewell',     division:1, color:'#E0C24A', color2:'#0C2B20'},
+  {id:'BRK', name:'Brackenport',   division:1, color:'#6BBF6B', color2:'#1B4E3A'},
+  {id:'VEL', name:'Velmoor Town',  division:1, color:'#9A6BD9', color2:'#0C2B20'},
+  {id:'ASH', name:'Ashcombe Ath.', division:1, color:'#C97A3D', color2:'#1B4E3A'},
 ];
+
 /* Given/family names below are common, everyday names drawn from public
    open name-frequency datasets (e.g. national statistics/census-style
    given-name and surname frequency lists) — generic name pools, not the
@@ -1475,6 +1477,12 @@ function beginFriendMatch(kickoff){
     mySide, friendMode: true,
     homePlayerMap: mySide==='home' ? kickoff.home_player_map : null,
     awayPlayerMap: mySide==='away' ? kickoff.away_player_map : null,
+    // Real DB team_ids for both sides — this is what lets the Live Trade
+    // panel actually propose a trade to the opponent's real team row
+    // rather than a fake seeded club.
+    myTeamId: mySide==='home' ? kickoff.home_team_id : kickoff.away_team_id,
+    oppTeamId: mySide==='home' ? kickoff.away_team_id : kickoff.home_team_id,
+    myPlayerMap: mySide==='home' ? kickoff.home_player_map : kickoff.away_player_map,
   };
   document.getElementById('commentary-feed').innerHTML = '';
   document.getElementById('halftime-overlay').classList.add('hidden');
@@ -1512,9 +1520,197 @@ function connectFriendMatchSockets(matchId, side, token){
   m.socket.onclose = () => {
     if (m.live){ m.live = false; kickoffBtn.disabled = true; setLiveBadge('error', '● Disconnected'); }
   };
+
+  // Trading is scoped to a real friend match: only here do we have a real
+  // DB team_id for the opponent (m.oppTeamId) instead of a placeholder.
+  if (m.friendMode && m.myTeamId){
+    connectTradeSocket();
+    const tradeBtn = document.getElementById('live-trade-btn');
+    tradeBtn.style.display = '';
+  }
 }
 
 document.getElementById('friend-match-btn').addEventListener('click', openFriendMatchModal);
+
+/* ============================================================
+   LIVE TRADE — real trade negotiation between the two connected
+   managers in a friend match, backed by api/match_stream.py's
+   /trade/* routes + /ws/trades/{team_id}. Distinct from the
+   Transfer Market tab (renderTradeHub etc.), which only ever
+   negotiates against synthetic AI clubs seeded client-side.
+   ============================================================ */
+function connectTradeSocket(){
+  const m = state.match;
+  if (!m.myTeamId) return;
+  m.tradeOffers = m.tradeOffers || [];
+  const ws = new WebSocket(`${liveWsBase()}/ws/trades/${m.myTeamId}`);
+  m.tradeSocket = ws;
+  ws.onmessage = (msg) => {
+    const data = JSON.parse(msg.data);
+    if (data.type === 'snapshot'){
+      m.tradeOffers = data.offers || [];
+    } else if (data.type === 'trade_proposed' || data.type === 'trade_countered'){
+      const incoming = data.offer.to_team_id === m.myTeamId;
+      m.tradeOffers = [data.offer, ...m.tradeOffers.filter(o=>o.id!==data.offer.id)];
+      showToast(incoming ? `New trade offer from your opponent — check Live Trade.` : `Trade sent.`);
+    } else if (data.type === 'trade_accepted'){
+      m.tradeOffers = m.tradeOffers.filter(o=>o.id!==data.offer_id);
+      showToast(`Trade settled! ${data.settlement.players_moved} player(s) moved.`);
+    } else if (data.type === 'trade_declined'){
+      m.tradeOffers = m.tradeOffers.filter(o=>o.id!==data.offer_id);
+      showToast(`Trade offer declined.`);
+    }
+    updateLiveTradeBadge();
+    if (document.getElementById('live-trade-drawer')) renderLiveTradeInbox();
+  };
+  ws.onerror = () => {};
+}
+
+function updateLiveTradeBadge(){
+  const m = state.match;
+  const badge = document.getElementById('live-trade-badge');
+  const inboxCount = (m.tradeOffers||[]).filter(o=>o.to_team_id===m.myTeamId && o.status==='proposed').length;
+  badge.style.display = inboxCount ? '' : 'none';
+  badge.textContent = inboxCount ? `(${inboxCount})` : '';
+}
+
+async function fetchRoster(teamId){
+  const res = await fetch(`${LIVE_API_BASE}/team/${teamId}/roster`);
+  if (!res.ok) throw new Error('roster fetch failed');
+  return (await res.json()).players;
+}
+
+function openLiveTradePanel(){
+  const m = state.match;
+  if (!m.myTeamId || !m.oppTeamId){
+    showToast('Live Trade is only available inside a two-player friend match.');
+    return;
+  }
+  const backdrop = document.createElement('div');
+  backdrop.className = 'drawer-backdrop';
+  backdrop.id = 'live-trade-drawer';
+  backdrop.innerHTML = `
+    <div class="drawer">
+      <button class="btn btn-ghost btn-sm drawer-close" id="lt-close">Close</button>
+      <h3>Live Trade</h3>
+      <div class="drawer-sub">Negotiate directly with your opponent — real squads, settled instantly, ACID-safe.</div>
+
+      <div class="section-eyebrow" style="margin-top:18px;">INCOMING &amp; OUTGOING OFFERS</div>
+      <div id="lt-offers-list" class="empty-note">Loading…</div>
+
+      <div class="section-eyebrow" style="margin-top:20px;">PROPOSE A NEW TRADE</div>
+      <div id="lt-propose-body" class="empty-note">Loading squads…</div>
+    </div>`;
+  document.body.appendChild(backdrop);
+  backdrop.querySelector('#lt-close').addEventListener('click', () => document.body.removeChild(backdrop));
+  backdrop.addEventListener('click', (e) => { if (e.target===backdrop) document.body.removeChild(backdrop); });
+
+  renderLiveTradeInbox();
+  loadLiveTradeProposeForm();
+}
+
+function renderLiveTradeInbox(){
+  const m = state.match;
+  const list = document.getElementById('lt-offers-list');
+  if (!list) return;
+  const offers = (m.tradeOffers||[]).filter(o=>o.status==='proposed'||!('status' in o));
+  if (!offers.length){ list.innerHTML = `<div class="empty-note">No open offers yet.</div>`; return; }
+  list.innerHTML = offers.map(o => {
+    const incoming = o.to_team_id === m.myTeamId;
+    const flagColor = o.ml_flag==='ok' ? '#7CC77E' : o.ml_flag==='review' ? 'var(--floodlight)' : 'var(--card-red)';
+    return `
+    <div class="market-row" style="flex-direction:column; align-items:flex-start; gap:6px;">
+      <div><b>${incoming ? 'Incoming offer' : 'You proposed'}</b> — fairness
+        <span style="color:${flagColor}">${Math.round((o.ml_fairness_score||0)*100)}% (${o.ml_flag||'ok'})</span></div>
+      ${incoming ? `
+        <div>
+          <button class="btn btn-primary btn-sm" data-accept="${o.id}">Accept</button>
+          <button class="btn btn-ghost btn-sm" data-decline="${o.id}">Decline</button>
+        </div>` : `<div class="t-sub">Waiting on your opponent…</div>`}
+    </div>`;
+  }).join('');
+  list.querySelectorAll('[data-accept]').forEach(btn => btn.addEventListener('click', async () => {
+    btn.disabled = true;
+    const res = await fetch(`${LIVE_API_BASE}/trade/${btn.dataset.accept}/accept`, {method:'POST'});
+    if (!res.ok){ showToast('Could not settle that trade — it may have expired.'); btn.disabled = false; return; }
+    showToast('Trade accepted and settled!');
+  }));
+  list.querySelectorAll('[data-decline]').forEach(btn => btn.addEventListener('click', async () => {
+    btn.disabled = true;
+    await fetch(`${LIVE_API_BASE}/trade/${btn.dataset.decline}/decline`, {method:'POST'});
+  }));
+}
+
+async function loadLiveTradeProposeForm(){
+  const m = state.match;
+  const body = document.getElementById('lt-propose-body');
+  try {
+    const [mine, theirs] = await Promise.all([fetchRoster(m.myTeamId), fetchRoster(m.oppTeamId)]);
+    if (!document.getElementById('lt-propose-body')) return; // drawer closed while loading
+    body.innerHTML = `
+      <div class="field">
+        <label>Your player(s) to offer</label>
+        <select id="lt-my-players" multiple size="5" style="width:100%; padding:8px; border-radius:9px; background:var(--pitch-1); color:var(--chalk); border:1px solid var(--line-strong);">
+          ${mine.map(p=>`<option value="${p.id}" data-age="${p.age}" data-ovr="${p.overall}" data-pot="${p.potential}" data-cyl="${p.contract_years_left}" data-form="${p.current_form}">${p.name} (${p.position}, ${p.overall} OVR)</option>`).join('')}
+        </select>
+      </div>
+      <div class="field">
+        <label>Their player(s) you want</label>
+        <select id="lt-their-players" multiple size="5" style="width:100%; padding:8px; border-radius:9px; background:var(--pitch-1); color:var(--chalk); border:1px solid var(--line-strong);">
+          ${theirs.map(p=>`<option value="${p.id}" data-age="${p.age}" data-ovr="${p.overall}" data-pot="${p.potential}" data-cyl="${p.contract_years_left}" data-form="${p.current_form}">${p.name} (${p.position}, ${p.overall} OVR)</option>`).join('')}
+        </select>
+      </div>
+      <div class="field">
+        <label>Cash you add — <span id="lt-cash-mine-display">${fmtMoney(0)}</span></label>
+        <div class="slider-row"><input type="range" id="lt-cash-mine" min="0" max="${state.balance}" step="10000" value="0"></div>
+      </div>
+      <div class="field">
+        <label>Cash you request from them — <span id="lt-cash-theirs-display">${fmtMoney(0)}</span></label>
+        <div class="slider-row"><input type="range" id="lt-cash-theirs" min="0" max="${state.balance*2}" step="10000" value="0"></div>
+      </div>
+      <button class="btn btn-primary" style="width:100%; margin-top:12px;" id="lt-submit">Send offer</button>
+      <div id="lt-submit-note" class="t-sub" style="margin-top:8px;"></div>
+    `;
+    const cashMine = body.querySelector('#lt-cash-mine'), cashTheirs = body.querySelector('#lt-cash-theirs');
+    cashMine.addEventListener('input', () => body.querySelector('#lt-cash-mine-display').textContent = fmtMoney(Number(cashMine.value)));
+    cashTheirs.addEventListener('input', () => body.querySelector('#lt-cash-theirs-display').textContent = fmtMoney(Number(cashTheirs.value)));
+
+    body.querySelector('#lt-submit').addEventListener('click', async () => {
+      const leg = (opt) => ({
+        player_id: opt.value, age: Number(opt.dataset.age), overall: Number(opt.dataset.ovr),
+        potential: Number(opt.dataset.pot), contract_years_left: Number(opt.dataset.cyl),
+        current_form: Number(opt.dataset.form),
+      });
+      const offered = [...body.querySelector('#lt-my-players').selectedOptions].map(leg);
+      const requested = [...body.querySelector('#lt-their-players').selectedOptions].map(leg);
+      if (!offered.length && !requested.length && !Number(cashMine.value) && !Number(cashTheirs.value)){
+        showToast('Add at least one player or some cash to the offer.'); return;
+      }
+      const res = await fetch(`${LIVE_API_BASE}/trade/propose`, {
+        method: 'POST', headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({
+          from_team_id: m.myTeamId, to_team_id: m.oppTeamId,
+          players_offered: offered, players_requested: requested,
+          cash_from_proposer: Number(cashMine.value), cash_from_receiver: Number(cashTheirs.value),
+        }),
+      });
+      const data = await res.json();
+      const note = body.querySelector('#lt-submit-note');
+      if (!res.ok){
+        note.style.color = 'var(--card-red)';
+        note.textContent = data.error || 'Offer rejected by the fairness model.';
+        return;
+      }
+      note.style.color = '#7CC77E';
+      note.textContent = `Offer sent — fairness ${Math.round((data.ml_fairness_score||0)*100)}% (${data.ml_flag}).`;
+    });
+  } catch (e) {
+    body.innerHTML = `<div class="empty-note">Couldn't load squads — check your live connection.</div>`;
+  }
+}
+
+document.getElementById('live-trade-btn').addEventListener('click', openLiveTradePanel);
+
 
 function bootApp(){
   const club = CLUBS.find(c=>c.id===state.club);
@@ -2715,6 +2911,15 @@ function updateMatchUI(){
   document.getElementById('xg-away-bar').style.width = (100*m.awayXg/totalXg)+'%';
 }
 
+/* ---- Pacing: this offline demo sim should match the documented "90
+   in-game minutes compressed into ~2 real minutes" that the live backend
+   (api/match_stream.py's SECONDS_PER_GAME_MINUTE) actually delivers.
+   90 ticks * 1100ms = 99s of live play + the 20s half-time pause below
+   = ~119s, i.e. ~2 minutes. (This used to be a hardcoded 260ms, which
+   only added up to ~23s total — the match was blowing through 90
+   "minutes" in under half a minute, hence the fast-forwarding.) ---- */
+const SIM_TICK_MS = 1100;
+
 /* ---- Half-time: a real 20-second break (the sim compresses 90 minutes
    into ~2 real minutes, so a 20s pause here plays like roughly a full
    in-game minute of stoppage before the second half). The sim is NOT
@@ -2781,13 +2986,25 @@ function simTick(){
   m.momentum *= 0.96; // decay
 
   const rng = m.rng;
-  const homeStrength = m.homeSquad.reduce((a,p)=>a+p.overall,0) + m.momentum*40 + (m.mentality>0?20:0);
+  // Mentality (only the human side has a dial here; the bot plays neutral,
+  // 0) shifts territory the same way engine/match_engine.py's Python sim
+  // does for a live/backend match — a continuous +/-12 rather than a flat
+  // "attacking=+20" bonus, so a half-hearted push matters less than going
+  // all-out.
+  const homeStrength = m.homeSquad.reduce((a,p)=>a+p.overall,0) + m.momentum*40 + m.mentality*12;
   const awayStrength = m.awaySquad.reduce((a,p)=>a+p.overall,0) - m.momentum*40;
   const homeHasBall = rng() < homeStrength/(homeStrength+awayStrength);
   if (homeHasBall) m.homeTicks++; else m.awayTicks++;
   updateTacticalMap(homeHasBall, false);
 
-  if (rng() < 0.16){
+  // Tactical trade-off, mirroring the Python engine: pushing attacking
+  // mentality creates more of YOUR chances when you have the ball, but
+  // also leaves more space behind when you don't — it's not a free stat
+  // boost either direction. Defensive mentality is the mirror image: it
+  // doesn't create extra chances, but it compresses space and reduces how
+  // often the opponent carves you open.
+  const chanceProb = clamp(0.16 + (homeHasBall ? Math.max(0, m.mentality)*0.05 : m.mentality*0.04), 0.05, 0.32);
+  if (rng() < chanceProb){
     const attackers = (homeHasBall ? m.homeSquad : m.awaySquad).filter(p=>['ST','LW','RW','AM','CM'].includes(p.pos));
     const defenders = (homeHasBall ? m.awaySquad : m.homeSquad).filter(p=>['CB','LB','RB','DM'].includes(p.pos));
     const keeper = (homeHasBall ? m.awaySquad : m.homeSquad).find(p=>p.pos==='GK') || (homeHasBall?m.awaySquad:m.homeSquad)[0];
@@ -2850,7 +3067,7 @@ function simTick(){
   updateMatchUI();
 
   if (m.minute>=90){ m.running=false; pushEvent(`Full time.`, '', m.minute); document.getElementById('sim-start-btn').textContent='Match complete'; document.getElementById('sim-start-btn').disabled=true; return; }
-  setTimeout(simTick, 260); // compressed pacing for the demo
+  setTimeout(simTick, SIM_TICK_MS);
 }
 
 /* ============================================================
@@ -2877,7 +3094,9 @@ function closeLiveConnections(m){
   if (!m) return;
   try { m.socket && m.socket.close(); } catch(e){}
   try { m.tacticsSocket && m.tacticsSocket.close(); } catch(e){}
-  m.socket = null; m.tacticsSocket = null; m.live = false;
+  try { m.tradeSocket && m.tradeSocket.close(); } catch(e){}
+  m.socket = null; m.tacticsSocket = null; m.tradeSocket = null; m.live = false;
+  document.getElementById('live-trade-btn').style.display = 'none';
 }
 
 async function startLiveMatch(){
