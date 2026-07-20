@@ -15,6 +15,7 @@ solo against a bot, or as a **real two-player match** against a friend.
 - [Match Centre & the ML models](#match-centre--the-ml-models)
 - [ML model performance](#ml-model-performance)
 - [Two-player Quick Match](#two-player-quick-match)
+- [Quick Match Online (skill-based matchmaking)](#quick-match-online-skill-based-matchmaking)
 - [Running it locally](#running-it-locally)
 - [Deployment](#deployment)
 - [Troubleshooting: CORS / "Failed to fetch"](#troubleshooting-cors--failed-to-fetch)
@@ -267,6 +268,55 @@ to both sides as plain text.
 
 ---
 
+## Quick Match Online (skill-based matchmaking)
+
+A third way to get into a real two-player match, alongside the offline solo
+bot sim and the code-based Friend Match lobby above: click
+**"🌐 Quick Match Online"** and the server pairs you with whichever other
+*currently waiting* online manager has the closest starting-XI level —
+no code to share, no picking who you play.
+
+**Flow:**
+
+1. Your browser computes your level as the average `overall` of your
+   starting XI, then calls `POST /matchmaking/join` with your squad —
+   this returns a `ticket_id` + secret token and adds you to an in-memory
+   queue (`api/match_stream.py`'s `_MATCHMAKING_QUEUE`).
+2. It opens `/ws/matchmaking/{ticket_id}`, which repeatedly attempts to
+   pair you with the closest-level *other* waiting manager, and pushes a
+   `searching` status update (elapsed wait, current tolerance, queue size)
+   every ~1.5s while none qualifies yet.
+3. **Tolerance widens over time**, not just at the moment you join: a
+   candidate pairing is accepted once the level gap is within the *wider*
+   of either side's own current tolerance band (`_MM_BASE_TOLERANCE` at
+   0s, growing by `_MM_GROWTH_PER_SEC` every second waited, capped at
+   `_MM_MAX_TOLERANCE`). That means someone who queued a long time ago can
+   still pull in an opponent who only just joined, even before that fresh
+   arrival's own tolerance has had time to widen.
+4. Once a pair is found, the server reuses the same
+   `_provision_and_create_match` the Friend Match lobby uses — real
+   `teams`/`players` rows, a real `matches` row, and per-side tokens
+   registered in `_MATCH_SIDE_TOKENS` — and pushes a `kickoff` message
+   (match_id, team ids, player maps, your side, your token, and the
+   opponent's name/level) to both sockets. The frontend hands this
+   straight to the same `beginFriendMatch()` used by the lobby flow, so
+   the live match itself — side-token enforcement, shared simulation,
+   substitutions, Live Trade — behaves identically regardless of which
+   route got you into it.
+5. **Cancelling:** closing the modal (or the "Cancel search" button) calls
+   `POST /matchmaking/leave`, which removes your ticket from the queue —
+   as long as you haven't already been paired (a pairing that lands in the
+   same instant as a cancel just proceeds; there's no way to un-pair once
+   both sides have been provisioned).
+
+**Known limitation:** like the Friend Match lobby, the queue itself lives
+in an in-process dict, so this only matches people whose requests land on
+the same backend worker — a multi-worker/multi-region deployment needs
+this backed by something shared (Redis, a dedicated matchmaking service)
+instead.
+
+---
+
 ## Running it locally
 
 ```bash
@@ -398,11 +448,3 @@ pin down one canonical frontend URL first.
 - A disconnected friend-match player's socket dropping doesn't currently
   pause or forfeit the match — the simulation keeps running server-side for
   whoever's still connected.
-
----
-
-## Contact
-- Email: nnair7598@gmail.com
-- LinkedIn: https://www.linkedin.com/in/nikhil-nair-809248286
-
-**Thank You**
