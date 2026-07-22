@@ -5,6 +5,7 @@ with an ML fairness/anti-cheat check, 48-hour tournaments, and a live Match
 Centre whose simulation blends a rule-based/Gaussian engine with two trained
 PyTorch nets (shot quality, and pass/dribble/shot decision-making) — playable
 solo against a bot, or as a **real two-player match** against a friend.
+<img width="1917" height="868" alt="image" src="https://github.com/user-attachments/assets/30821235-6ea7-47b5-9dd8-b4ce336453b2" />
 
 ---
 
