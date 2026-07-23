@@ -6,10 +6,10 @@
 <title>TOUCHLINE — Manager Console</title>
 
 <!-- PWA -->
-<link rel="manifest" href="manifest.json" />
+<link rel="manifest" href="./manifest.json" />
 <meta name="theme-color" content="#0D0E12" />
 <link rel="icon" href="icon.svg" type="image/svg+xml" />
-<link rel="apple-touch-icon" href="icon.svg" />
+<link rel="apple-touch-icon" href="./icon.svg" />
 <meta name="mobile-web-app-capable" content="yes" />
 <meta name="apple-mobile-web-app-capable" content="yes" />
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
@@ -334,6 +334,8 @@ button{font-family:var(--font-body);cursor:pointer;}
 .filter-row{display:flex; gap:8px; margin-bottom:16px; flex-wrap:wrap;}
 .filter-pill{padding:7px 14px; border-radius:20px; border:1px solid var(--line-strong); background:transparent; color:var(--chalk-dim); font-size:12.5px; font-weight:600;}
 .filter-pill.active{background:var(--floodlight); color:#0B0F04; border-color:var(--floodlight);}
+.scout-pill{padding:7px 14px; border-radius:20px; border:1px solid var(--line-strong); background:transparent; color:var(--chalk-dim); font-size:12.5px; font-weight:600;}
+.scout-pill.active{background:var(--floodlight); color:#0B0F04; border-color:var(--floodlight);}
 .search-input{flex:1; min-width:160px; padding:9px 13px; border-radius:20px; border:1px solid var(--line-strong); background:var(--pitch-2); color:var(--chalk); font-size:13px;}
 
 .player-list{display:flex; flex-direction:column; gap:10px;}
@@ -712,6 +714,7 @@ button{font-family:var(--font-body);cursor:pointer;}
         <button class="nav-tab" data-view="dugout">Dugout</button>
         <button class="nav-tab" data-view="teamsheet">Team Sheet</button>
         <button class="nav-tab" data-view="market">Transfer Market</button>
+        <button class="nav-tab" data-view="scouting">Scouting</button>
         <button class="nav-tab" data-view="tournaments">Tournaments</button>
         <button class="nav-tab" data-view="training">Training</button>
         <button class="nav-tab" data-view="match">Match Center</button>
@@ -808,6 +811,22 @@ button{font-family:var(--font-body);cursor:pointer;}
           <div id="tradehub-content"></div>
         </div>
       </div>
+    </div>
+
+    <!-- ---------- SCOUTING ---------- -->
+    <div class="view hidden" id="view-scouting">
+      <div class="section-title"><h2>Scouting</h2></div>
+      <p class="section-sub">Sign unattached free agents straight onto your books — real new bodies in the squad, not a swap, so you've actually got fresh legs to rotate in. Squad: <span id="scout-squad-count" class="mono"></span></p>
+
+      <div class="filter-row">
+        <button class="scout-pill active" data-scoutpos="ALL">All</button>
+        <button class="scout-pill" data-scoutpos="GK">GK</button>
+        <button class="scout-pill" data-scoutpos="DEF">DEF</button>
+        <button class="scout-pill" data-scoutpos="MID">MID</button>
+        <button class="scout-pill" data-scoutpos="ATT">ATT</button>
+        <button class="btn btn-ghost btn-sm" id="scout-refresh-btn" style="margin-left:auto;">🔄 New scouting report</button>
+      </div>
+      <div class="player-list" id="scout-list"></div>
     </div>
 
     <!-- ---------- TOURNAMENTS ---------- -->
@@ -1187,6 +1206,124 @@ function buildLeague(){
   return league;
 }
 const LEAGUE = buildLeague();
+
+/* ============================================================
+   SCOUTING — a rotating pool of unattached free-agent players,
+   separate from every club's roster. Signing one is a genuine
+   NEW player joining the squad (bench grows past the default
+   16), not a swap against another club like the Transfer Market
+   — this is what actually widens matchday rotation options
+   rather than just reshuffling the same bodies.
+   ============================================================ */
+const MAX_SQUAD_SIZE = 23;    // real-world matchday squad cap
+const SCOUT_POOL_SIZE = 14;   // how many free agents are "on the board" at once
+let freeAgentBatch = 0;       // bumped on every refresh so ids never collide with earlier signings
+let FREE_AGENTS = [];
+
+function genFreeAgent(rng, i){
+  const p = genPlayer(rng, 'FA', i);
+  p.id = `FA-${freeAgentBatch}-${i}`;
+  p.club = null;               // unattached — not owned by any club in LEAGUE
+  p.fee = Math.round(p.value * 0.18); // signing-on fee: cheaper than a full transfer, no club to compensate
+  return p;
+}
+
+function refreshScoutingReport(){
+  freeAgentBatch++;
+  const rng = seededRandom(Math.floor(Math.random()*1_000_000) + freeAgentBatch);
+  FREE_AGENTS = Array.from({length: SCOUT_POOL_SIZE}, (_, i) => genFreeAgent(rng, i));
+}
+refreshScoutingReport();
+
+function signFreeAgent(playerId){
+  const idx = FREE_AGENTS.findIndex(p => p.id === playerId);
+  if (idx === -1) return;
+  const p = FREE_AGENTS[idx];
+  const squad = LEAGUE[state.club];
+
+  if (squad.length >= MAX_SQUAD_SIZE){
+    showToast(`Squad's full at ${MAX_SQUAD_SIZE} — you'll need to trade or release someone first.`);
+    return;
+  }
+  if (state.balance < p.fee){
+    showToast(`Not enough in the bank — signing ${p.name} needs ${fmtMoney(p.fee)}.`);
+    return;
+  }
+
+  state.balance -= p.fee;
+  const usedNumbers = new Set(squad.map(s => s.number));
+  let num = 12;
+  while (usedNumbers.has(num) && num < 100) num++;
+  p.number = num;
+  p.club = state.club;
+  p.xp = 0;
+  delete p.fee;
+
+  squad.push(p);
+  FREE_AGENTS.splice(idx, 1);
+
+  // New signing lands straight on the bench so it's immediately available
+  // for rotation without disturbing whatever XI is currently set.
+  if (myLineup && myLineup.club === state.club){
+    myLineup.benchIds.push(p.id);
+  }
+
+  document.getElementById('balance-value').textContent = fmtMoney(state.balance);
+  renderDugout();
+  renderTeamSheet();
+  renderScouting();
+  showToast(`Signed ${p.name} (${p.pos}, ${p.overall} OVR) — added to the bench, squad is now ${squad.length}/${MAX_SQUAD_SIZE}.`);
+}
+
+let scoutFilter = 'ALL';
+function renderScouting(){
+  const list = document.getElementById('scout-list');
+  if (!list) return;
+  const squad = LEAGUE[state.club] || [];
+  const countEl = document.getElementById('scout-squad-count');
+  if (countEl) countEl.textContent = `${squad.length}/${MAX_SQUAD_SIZE}`;
+
+  const full = squad.length >= MAX_SQUAD_SIZE;
+  const rows = FREE_AGENTS
+    .filter(p => scoutFilter === 'ALL' || POS_GROUP[p.pos] === scoutFilter)
+    .sort((a,b) => b.overall - a.overall);
+
+  if (!rows.length){
+    list.innerHTML = `<div class="empty-note">No free agents match that filter right now — try another position or refresh the report.</div>`;
+    return;
+  }
+
+  list.innerHTML = rows.map(p => `
+    <div class="market-row">
+      <div class="mr-badge" style="background:linear-gradient(145deg, var(--chalk-dim), var(--pitch-3));">${p.pos}</div>
+      <div>
+        <div class="mr-name">${p.name}</div>
+        <div class="mr-club">Free agent · age ${p.age}</div>
+      </div>
+      <div class="mr-stat"><span class="l">OVR</span><span class="v">${p.overall}</span></div>
+      <div class="mr-stat"><span class="l">POT</span><span class="v">${p.potential}</span></div>
+      <div class="mr-value">${fmtMoney(p.fee)}</div>
+      <button class="btn btn-primary btn-sm" data-sign="${p.id}" ${full ? 'disabled' : ''}>${full ? 'Squad full' : 'Sign'}</button>
+    </div>`).join('');
+
+  list.querySelectorAll('[data-sign]').forEach(btn => {
+    btn.addEventListener('click', () => signFreeAgent(btn.dataset.sign));
+  });
+}
+
+document.querySelectorAll('.scout-pill').forEach(btn => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('.scout-pill').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    scoutFilter = btn.dataset.scoutpos;
+    renderScouting();
+  });
+});
+document.getElementById('scout-refresh-btn').addEventListener('click', () => {
+  refreshScoutingReport();
+  renderScouting();
+  showToast('Scouting report refreshed — new free agents on the board.');
+});
 
 /* ---- Formation layouts: percentage coordinates on the pitch, GK first ---- */
 const FORMATIONS = {
@@ -1675,6 +1812,7 @@ function switchView(view){
   document.getElementById('view-'+view).classList.remove('hidden');
   document.querySelectorAll('.nav-tab').forEach(t => t.classList.toggle('active', t.dataset.view===view));
   if (view === 'training') renderTraining();
+  if (view === 'scouting') renderScouting();
 }
 document.querySelectorAll('.nav-tab').forEach(t => t.addEventListener('click', () => switchView(t.dataset.view)));
 document.getElementById('goto-match-btn').addEventListener('click', () => switchView('match'));
@@ -2147,6 +2285,7 @@ function bootApp(){
   renderDugout();
   renderTeamSheet();
   renderMarket();
+  renderScouting();
   seedInbox();
   renderTradeHub('outbox');
   buildTournaments();
@@ -3985,7 +4124,7 @@ renderTicker();
 /* ---- PWA: register service worker (no-ops gracefully on file://, older browsers) ---- */
 if ('serviceWorker' in navigator && (location.protocol === 'https:' || location.hostname === 'localhost')) {
   window.addEventListener('load', () => {
-    navigator.serviceWorker.register('sw.js').catch(() => { /* offline shell unavailable, app still works online */ });
+    navigator.serviceWorker.register('./sw.js').catch(() => { /* offline shell unavailable, app still works online */ });
   });
 }
 
