@@ -94,12 +94,40 @@ class AsyncLibsqlClient:
         rows = [Row(columns, r) for r in cur.fetchall()] if cur.description else []
         return ResultSet(columns=columns, rows=rows, rows_affected=cur.rowcount or 0)
 
-    def _execute_sync(self, sql: str, args: Sequence[Any] | None) -> ResultSet:
-        cur = self._conn.cursor()
-        cur.execute(sql, tuple(args) if args else ())
-        result = self._row_result(cur)
-        self._conn.commit()
-        return result
+    def _execute_sync(self, sql: str, args=None):
+        def run():
+            cur = self._conn.cursor()
+            cur.execute(sql, tuple(args) if args else ())
+            result = self._row_result(cur)
+            self._conn.commit()
+            return result
+
+        try:
+            return run()
+
+        except Exception as e:
+        # Roll back any pending transaction
+            try:
+                self._conn.rollback()
+            except Exception:
+                pass
+
+        # Reconnect only if the Hrana stream is stale
+            if "stream not found" in str(e).lower():
+                try:
+                    self._conn.close()
+                except Exception:
+                    pass
+
+                self._conn = libsql.connect(
+                    database=os.environ["TURSO_DATABASE_URL"],
+                    auth_token=os.environ.get("TURSO_AUTH_TOKEN"),
+                )
+
+            # Retry exactly once
+                return run()
+
+            raise
 
     async def execute(self, sql: str, args: Sequence[Any] | None = None) -> ResultSet:
         async with self._lock:
