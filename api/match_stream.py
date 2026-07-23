@@ -2,10 +2,13 @@
 WebSocket match streamer.
 
 Compresses a 90-minute match into ~2 real minutes: 1 in-game minute ==
-1.33 real seconds (90 * 1.33 ≈ 120s). Only *emitted* events carry a real
-delay proportional to how many in-game minutes elapsed since the last
-event, so quiet stretches fly by and the 2-minute thrill still lands on
-the goals/chances that matter.
+1.33 real seconds (90 * 1.33 ≈ 120s). The ML/rules engine still only
+*decides* things at its own sparse pace (only "notable" minutes yield an
+event — see engine/match_engine.py), but the on-screen clock does NOT
+wait silently for those decisions: between events this module ticks the
+clock every ~1 real second (`clock_tick` broadcasts, interpolated from
+elapsed real time) so the minute counts up continuously instead of
+freezing and then jumping the moment the next chance/goal is decided.
 
 Two things this module owns that the pure `engine.match_engine` generator
 deliberately does NOT (it has no I/O):
@@ -1204,15 +1207,48 @@ async def _run_match_simulation(match_id: str, owner_token: str) -> None:
             elapsed_minutes = max(0, event["minute"] - last_minute)
             delay = elapsed_minutes * SECONDS_PER_GAME_MINUTE
             if delay > 0:
-                # NOTE: no cap here. Commentary events are sparse (only
-                # "notable" minutes get one — see engine/match_engine.py),
-                # so gaps of 15-30 game-minutes between events are normal.
-                # The whole point of SECONDS_PER_GAME_MINUTE is that 90
-                # game-minutes' worth of these delays sums to ~2 real
-                # minutes; artificially capping any single gap (this used
-                # to cap at 6s) throws that budget away and makes the
-                # match finish in under a minute instead.
-                await asyncio.sleep(delay)
+                # NOTE: no cap on the TOTAL gap here. Commentary/ML-decision
+                # events are sparse (only "notable" minutes get one — see
+                # engine/match_engine.py), so gaps of 15-30 game-minutes
+                # between events are normal. The whole point of
+                # SECONDS_PER_GAME_MINUTE is that 90 game-minutes' worth of
+                # these delays sums to ~2 real minutes; artificially capping
+                # any single gap (this used to cap at 6s) throws that budget
+                # away and makes the match finish in under a minute instead.
+                #
+                # BUT we don't just sleep(delay) in one block any more — that
+                # made the on-screen clock sit frozen for the whole gap and
+                # then jump straight to the next event's minute the instant
+                # the ML/event generator produced something, i.e. the timer
+                # only ever moved on an ML decision instead of running
+                # continuously. Instead, sleep in ~1-real-second steps and
+                # broadcast a lightweight `clock_tick` after each one, with
+                # the minute interpolated from real elapsed time. The
+                # generator above is completely unaffected — it has already
+                # decided everything up to `event`; this loop is purely
+                # pacing the *visible* clock smoothly while we wait to reveal
+                # it, so ML decisions keep happening at their own pace
+                # "behind the scenes" and the clock no longer stalls between
+                # them.
+                start_minute = last_minute
+                remaining = delay
+                while remaining > 0:
+                    step = min(1.0, remaining)
+                    await asyncio.sleep(step)
+                    remaining -= step
+                    if await _watchdog_tick(match_id, runner, client, last_minute):
+                        return
+                    elapsed_real = delay - remaining
+                    interp_minute = start_minute + elapsed_real / SECONDS_PER_GAME_MINUTE
+                    interp_minute = min(interp_minute, event["minute"])
+                    await _broadcast(runner, match_id, {
+                        "type": "clock_tick", "match_id": match_id,
+                        "minute": round(interp_minute, 2),
+                        "home_score": runner.last_home_score,
+                        "away_score": runner.last_away_score,
+                        "momentum": None,
+                        "sent_at": datetime.now(timezone.utc).isoformat(),
+                    })
             last_minute = event["minute"]
 
             payload = {**event, "match_id": match_id, "sent_at": datetime.now(timezone.utc).isoformat()}
