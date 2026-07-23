@@ -51,12 +51,53 @@ from pydantic import BaseModel
 from db.turso_client import get_client, ensure_match_schema
 from db.auth import authenticate_user, create_user, ensure_auth_schema
 from engine.match_engine import PlayerSnapshot, TeamSnapshot, apply_substitution, simulate_match
-from engine.ml_bridge import MLBridge
+from engine.ml_bridge import MLBridge, PitchContext
 from api import state_backend
 
 app = FastAPI(title="Football Sim Match Streamer")
 
 _schema_ensured = False
+
+
+@app.on_event("startup")
+async def _prewarm_ml_bridge() -> None:
+    """Loads the ML nets AND runs one throwaway inference through each, at
+    process boot, instead of paying that cost mid-match.
+
+    `MLBridge.load()` is already memoized via `@lru_cache`, so deserializing
+    the .pth/.pkl files themselves only ever costs anything once per
+    process. The real first-call tax lives inside PyTorch: the very first
+    forward pass through an `nn.Module` spins up its CPU thread pool,
+    allocator, etc — meaningfully slower than every call after it. Without
+    this warm-up, that one-time hitch lands wherever a match's first shot
+    decision happens to fall, which is always somewhere in the first half
+    (there's no shot before there's a match). That's the actual reason the
+    first half can feel choppier than the second — the second half was
+    never sped up, the first half was just paying rent the second half had
+    already covered. Combined with a cold-started host (see the CORS notes
+    below re: Render's free tier), a fresh process — and this exact
+    stutter — can happen on nearly every match, not just the very first
+    one ever played.
+
+    Runs in a thread so a slow disk read for the weight files doesn't block
+    the event loop from serving /health (or anything else) while the server
+    is coming up. Failures here are swallowed — a match should still be
+    playable (in pure rule-based/no-ML fallback mode) even if this warm-up
+    hiccups; `simulate_match` already handles `MLBridge().available == False`
+    gracefully on its own.
+    """
+    def _warm() -> None:
+        bridge = MLBridge.load()
+        if not bridge.available:
+            return
+        dummy_ctx = PitchContext(x=90.0, y=40.0, under_pressure=True)
+        bridge.decide(dummy_ctx, mentality=0.0)
+        bridge.xg(dummy_ctx)
+
+    try:
+        await asyncio.to_thread(_warm)
+    except Exception as exc:  # pragma: no cover - best-effort only
+        print(f"[startup] ML bridge warm-up skipped: {exc}")
 
 
 async def _ensure_schema(client) -> None:
