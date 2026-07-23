@@ -202,13 +202,13 @@ async def insert_players(df: pd.DataFrame, owner_team_id: str | None) -> None:
                 [row["id"], owner_team_id],
             ))
 
-    import libsql_client
+    from db.turso_client import Statement
     # Batched in chunks (a single multi-thousand-statement batch can hit
     # payload limits on some Turso plans).
     CHUNK = 200
     for i in range(0, len(statements), CHUNK):
         chunk = statements[i:i + CHUNK]
-        await client.batch([libsql_client.Statement(sql, args) for sql, args in chunk])
+        await client.batch([Statement(sql, args) for sql, args in chunk])
         print(f"  inserted {min(i + CHUNK, len(statements))}/{len(statements)} statements...")
 
 

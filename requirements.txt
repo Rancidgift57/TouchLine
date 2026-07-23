@@ -1,10 +1,18 @@
 fastapi>=0.111
 uvicorn[standard]>=0.30
 websockets>=12.0
-libsql-client>=0.3.1
+libsql>=0.1.0  # replaces the archived libsql-client (websocket driver retired on AWS-hosted DBs)
 numpy>=1.26
 scipy>=1.13
 python-dotenv>=1.0
+
+# Optional: only imported/used when REDIS_URL is set (see
+# api/state_backend.py). Backs the friend-match lobby, side tokens, live
+# substitution queue, and match event stream across multiple uvicorn
+# workers/instances. Without REDIS_URL, everything falls back to the old
+# in-process-dict behavior — fine for a single dev worker, not for a real
+# multi-worker deployment.
+redis>=5.0
 
 # ML (engine/ml_bridge.py, ml/*_architecture.py) — the engine degrades to
 # pure rule-based/Gaussian mode if these aren't installed, but install them

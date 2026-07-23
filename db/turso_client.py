@@ -2,37 +2,137 @@
 Turso (libSQL) client wrapper.
 
 Install:
-    pip install libsql-client
+    pip install libsql
 
 Env vars expected:
     TURSO_DATABASE_URL   e.g. "libsql://your-db-name-org.turso.io"
     TURSO_AUTH_TOKEN     token from `turso db tokens create your-db-name`
 
 This module exposes:
-    get_client()                -> a shared libsql_client.Client
+    get_client()                -> a shared AsyncLibsqlClient
     run_migrations(schema_path) -> applies db/schema.sql
     execute_trade(offer_id)     -> ACID-safe multi-table trade settlement
+
+MIGRATION NOTE (2026): this used to run on `libsql_client`, the archived
+websocket-based Python SDK. Turso moved Free Tier databases from Fly.io to
+AWS and, as part of that, retired websocket-based driver support for
+AWS-hosted databases after June 18, 2025 (see
+https://turso.tech/blog/new-sdks-for-python-and-sqlalchemy). Any database
+whose hostname looks like `*.aws-<region>.turso.io` now rejects that old
+driver's websocket upgrade outright with `WSServerHandshakeError: 400` —
+it isn't an auth/token/paused-database problem, and it will never succeed
+no matter how many times you retry or rotate the token: the server
+literally no longer speaks that protocol at that address. The fix is
+Turso's officially supported successor package, `libsql`, which talks
+HTTP instead. Its Connection/Cursor API is synchronous (sqlite3-style:
+connect() / execute() / commit() / fetchall()) rather than async, so
+AsyncLibsqlClient below wraps it with asyncio.to_thread so the FastAPI
+event loop is never blocked, and reproduces the async execute()/batch()
+interface plus dict-style row access (row["col"]) the rest of this
+codebase (db/auth.py, execute_trade, etc.) already depends on -- no other
+file needs to change.
 """
 
 from __future__ import annotations
 
+import asyncio
 import os
 import uuid
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Sequence
 
-import libsql_client
-
-_client: libsql_client.Client | None = None
+import libsql
 
 
-def get_client() -> libsql_client.Client:
+class Row(dict):
+    """Dict-like row that also supports positional access, matching how
+    the rest of this codebase indexes results (row["column_name"])."""
+
+    def __init__(self, columns: Sequence[str], values: Sequence[Any]):
+        super().__init__(zip(columns, values))
+        self._values = tuple(values)
+
+    def __getitem__(self, key):
+        if isinstance(key, int):
+            return self._values[key]
+        return super().__getitem__(key)
+
+
+@dataclass
+class ResultSet:
+    columns: tuple[str, ...]
+    rows: list[Row]
+    rows_affected: int = 0
+
+
+@dataclass
+class Statement:
+    """Drop-in replacement for the old libsql_client.Statement."""
+
+    sql: str
+    args: Sequence[Any] = field(default_factory=list)
+
+
+class AsyncLibsqlClient:
+    """Async-compatible wrapper around the synchronous `libsql` Connection.
+
+    A single Connection is shared across the process (same pattern as the
+    old client), so all access is serialized through an asyncio.Lock —
+    the underlying sqlite3-style connection isn't meant to be driven by
+    multiple threads concurrently, and serializing also keeps `batch()`
+    genuinely atomic with no other statement able to interleave.
+    """
+
+    def __init__(self, url: str, auth_token: str | None):
+        self._conn = libsql.connect(database=url, auth_token=auth_token)
+        self._lock = asyncio.Lock()
+
+    @staticmethod
+    def _row_result(cur) -> ResultSet:
+        columns = tuple(d[0] for d in cur.description) if cur.description else ()
+        rows = [Row(columns, r) for r in cur.fetchall()] if cur.description else []
+        return ResultSet(columns=columns, rows=rows, rows_affected=cur.rowcount or 0)
+
+    def _execute_sync(self, sql: str, args: Sequence[Any] | None) -> ResultSet:
+        cur = self._conn.cursor()
+        cur.execute(sql, tuple(args) if args else ())
+        result = self._row_result(cur)
+        self._conn.commit()
+        return result
+
+    async def execute(self, sql: str, args: Sequence[Any] | None = None) -> ResultSet:
+        async with self._lock:
+            return await asyncio.to_thread(self._execute_sync, sql, args)
+
+    def _batch_sync(self, statements: list[Statement]) -> list[ResultSet]:
+        results = []
+        try:
+            for stmt in statements:
+                cur = self._conn.cursor()
+                cur.execute(stmt.sql, tuple(stmt.args) if stmt.args else ())
+                results.append(self._row_result(cur))
+            self._conn.commit()
+        except Exception:
+            self._conn.rollback()
+            raise
+        return results
+
+    async def batch(self, statements: list[Statement]) -> list[ResultSet]:
+        async with self._lock:
+            return await asyncio.to_thread(self._batch_sync, statements)
+
+
+_client: AsyncLibsqlClient | None = None
+
+
+def get_client() -> AsyncLibsqlClient:
     """Lazily create a single shared libSQL client for the process."""
     global _client
     if _client is None:
         url = os.environ["TURSO_DATABASE_URL"]
         token = os.environ.get("TURSO_AUTH_TOKEN")
-        _client = libsql_client.create_client(url=url, auth_token=token)
+        _client = AsyncLibsqlClient(url=url, auth_token=token)
     return _client
 
 
@@ -44,6 +144,33 @@ async def run_migrations(schema_path: str = "db/schema.sql") -> None:
     statements = [s.strip() for s in sql.split(";") if s.strip() and not s.strip().startswith("--")]
     for stmt in statements:
         await client.execute(stmt)
+
+
+async def ensure_match_schema(client) -> None:
+    """
+    Idempotent, safe to call on every backend boot (mirrors db/auth.py's
+    ensure_auth_schema) — `CREATE TABLE IF NOT EXISTS` won't retroactively
+    add a column/index to tables that already existed before persistent
+    squads / forfeit-tracking were introduced, so these ALTERs run once
+    each and no-op (catch the duplicate-column/index-exists error) after.
+    """
+    try:
+        await client.execute("ALTER TABLE player_rights ADD COLUMN client_ref_id TEXT")
+    except Exception as e:  # noqa: BLE001 - libsql raises a generic error for "duplicate column"
+        if "duplicate column" not in str(e).lower():
+            raise
+    try:
+        await client.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_rights_owner_clientref "
+            "ON player_rights(owner_team_id, client_ref_id) WHERE client_ref_id IS NOT NULL"
+        )
+    except Exception:
+        pass
+    try:
+        await client.execute("ALTER TABLE matches ADD COLUMN forfeited_side TEXT")
+    except Exception as e:  # noqa: BLE001
+        if "duplicate column" not in str(e).lower():
+            raise
 
 
 class TradeRejected(Exception):
@@ -154,9 +281,9 @@ async def execute_trade(offer_id: str) -> dict[str, Any]:
         [now, offer_id],
     ))
 
-    # libsql_client.batch() runs every statement inside one transaction and
+    # client.batch() runs every statement inside one transaction and
     # rolls back entirely on any failure -> ACID guarantee for the swap.
-    await client.batch([libsql_client.Statement(sql, args) for sql, args in statements])
+    await client.batch([Statement(sql, args) for sql, args in statements])
 
     return {
         "offer_id": offer_id,
@@ -199,7 +326,7 @@ async def create_trade_offer(
     expires_at = now.timestamp() + expires_in_hours * 3600
 
     statements = [
-        libsql_client.Statement(
+        Statement(
             "INSERT INTO trade_offers (id, from_team_id, to_team_id, parent_offer_id, status, "
             "ml_fairness_score, ml_flag, expires_at) VALUES (?, ?, ?, ?, 'proposed', ?, ?, ?)",
             [offer_id, from_team_id, to_team_id, parent_offer_id, ml_fairness_score, ml_flag,
@@ -207,27 +334,27 @@ async def create_trade_offer(
         ),
     ]
     if parent_offer_id:
-        statements.append(libsql_client.Statement(
+        statements.append(Statement(
             "UPDATE trade_offers SET status = 'countered', resolved_at = ? WHERE id = ?",
             [now.isoformat(), parent_offer_id],
         ))
     for player_id in players_to_receiving_team:
-        statements.append(libsql_client.Statement(
+        statements.append(Statement(
             "INSERT INTO trade_offer_players (offer_id, player_id, direction) VALUES (?, ?, 'to_receiving_team')",
             [offer_id, player_id],
         ))
     for player_id in players_to_proposing_team:
-        statements.append(libsql_client.Statement(
+        statements.append(Statement(
             "INSERT INTO trade_offer_players (offer_id, player_id, direction) VALUES (?, ?, 'to_proposing_team')",
             [offer_id, player_id],
         ))
     if from_team_cash or to_team_cash:
-        statements.append(libsql_client.Statement(
+        statements.append(Statement(
             "INSERT INTO trade_offer_cash (offer_id, from_team_cash, to_team_cash) VALUES (?, ?, ?)",
             [offer_id, from_team_cash, to_team_cash],
         ))
     for clause in clauses or []:
-        statements.append(libsql_client.Statement(
+        statements.append(Statement(
             "INSERT INTO trade_offer_clauses (offer_id, player_id, clause_type, buyback_fee, "
             "buyback_expires_season, sell_on_percentage) VALUES (?, ?, ?, ?, ?, ?)",
             [offer_id, clause["player_id"], clause["clause_type"], clause.get("buyback_fee"),
@@ -321,11 +448,11 @@ async def propose_counter_offer(original_offer_id: str, new_offer_payload: dict[
     client = get_client()
     new_id = str(uuid.uuid4())
     await client.batch([
-        libsql_client.Statement(
+        Statement(
             "UPDATE trade_offers SET status = 'countered', resolved_at = ? WHERE id = ?",
             [datetime.now(timezone.utc).isoformat(), original_offer_id],
         ),
-        libsql_client.Statement(
+        Statement(
             "INSERT INTO trade_offers (id, from_team_id, to_team_id, parent_offer_id, status, expires_at) "
             "VALUES (?, ?, ?, ?, 'proposed', ?)",
             [

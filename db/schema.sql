@@ -93,10 +93,25 @@ CREATE TABLE IF NOT EXISTS player_rights (
     sell_on_percentage        REAL CHECK (sell_on_percentage IS NULL OR (sell_on_percentage BETWEEN 0 AND 1)),
     sell_on_beneficiary_team_id TEXT REFERENCES teams(id),
 
+    -- Stable link back to the frontend's client-generated player id for a
+    -- *persistent* (logged-in-manager) squad. Lets api/match_stream.py's
+    -- quick-match/friend-match provisioning UPDATE the same player row on
+    -- every kickoff instead of INSERTing a brand-new uuid'd player each
+    -- time — see _upsert_squad() in api/match_stream.py. NULL for players
+    -- belonging to ephemeral guest/demo teams (no client_ref_id to key on).
+    client_ref_id              TEXT,
+
     updated_at                TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
 CREATE INDEX IF NOT EXISTS idx_rights_owner ON player_rights(owner_team_id);
+
+-- Lets _upsert_squad() find "the row I already created for this frontend
+-- player id, under this team" in one query. Partial index (client_ref_id
+-- IS NOT NULL) so ephemeral guest players — which never set it — don't
+-- collide with each other under the same NULL value.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_rights_owner_clientref
+    ON player_rights(owner_team_id, client_ref_id) WHERE client_ref_id IS NOT NULL;
 
 -- ---------------------------------------------------------------------------
 -- Trade Negotiation State Machine
@@ -176,6 +191,14 @@ CREATE TABLE IF NOT EXISTS matches (
 
     -- seed persisted so a match replay is byte-for-byte reproducible
     rng_seed      INTEGER,
+
+    -- Set when a friend-match ends because one side's socket never came
+    -- back within the grace period (see _handle_side_disconnect in
+    -- api/match_stream.py) rather than by reaching full_time normally.
+    -- status still resolves to 'completed' (walkover) so downstream
+    -- reporting doesn't need a new status value; this column is what
+    -- distinguishes "won 3-0 by forfeit" from "won 3-0 on the pitch".
+    forfeited_side TEXT CHECK (forfeited_side IN ('home','away')),
 
     created_at    TEXT NOT NULL DEFAULT (datetime('now'))
 );

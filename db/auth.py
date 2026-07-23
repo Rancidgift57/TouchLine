@@ -38,19 +38,23 @@ def verify_password(password: str, stored: str) -> bool:
         return False
 
 
-async def ensure_auth_schema(client) -> None:
-    """
-    Idempotent, safe to call on every backend boot. `CREATE TABLE IF NOT
-    EXISTS` (in schema.sql) won't retroactively add a column to a `users`
-    table that already existed before password_hash was introduced, so this
-    ALTER runs once and no-ops (catches the duplicate-column error) after.
-    """
-    try:
+async def ensure_auth_schema(client):
+    # 1. Ensure the base users table exists
+    await client.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            email TEXT PRIMARY KEY,
+            manager_name TEXT,
+            club_name TEXT
+        )
+    """)
+    
+    # 2. Ask SQLite for a list of all columns currently in the 'users' table
+    res = await client.execute("PRAGMA table_info(users)")
+    existing_columns = [row["name"] for row in res.rows]
+    
+    # 3. Only attempt to add the column if it doesn't exist yet
+    if "password_hash" not in existing_columns:
         await client.execute("ALTER TABLE users ADD COLUMN password_hash TEXT NOT NULL DEFAULT ''")
-    except Exception as e:  # noqa: BLE001 - libsql raises a generic error for "duplicate column"
-        if "duplicate column" not in str(e).lower():
-            raise
-
 
 async def create_user(client, email: str, password: str, manager_name: str, club_name: str) -> dict:
     email_norm = email.strip().lower()

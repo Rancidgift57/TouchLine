@@ -699,6 +699,7 @@ button{font-family:var(--font-body);cursor:pointer;}
         <button class="nav-tab" data-view="teamsheet">Team Sheet</button>
         <button class="nav-tab" data-view="market">Transfer Market</button>
         <button class="nav-tab" data-view="tournaments">Tournaments</button>
+        <button class="nav-tab" data-view="training">Training</button>
         <button class="nav-tab" data-view="match">Match Center</button>
       </div>
       <div class="topbar-right">
@@ -832,6 +833,21 @@ button{font-family:var(--font-body);cursor:pointer;}
           </div>
         </div>
       </div>
+    </div>
+
+    <!-- ---------- TRAINING ROOM ---------- -->
+    <div class="view hidden" id="view-training">
+      <div class="section-title"><h2>Training Room</h2></div>
+      <p class="section-sub">Run drills to build player XP — level a player up and their overall nudges toward their potential. Win a tournament and the whole squad gets a bonus XP haul. Manager XP comes from playing live two-player Quick Matches against other managers.</p>
+
+      <div class="card" id="mgr-xp-card" style="margin-bottom:16px;"></div>
+
+      <div class="tourney-actions-row">
+        <button class="btn btn-primary btn-sm" id="train-squad-btn">🏋️ Run full-squad session</button>
+        <span class="section-sub" id="train-squad-cooldown" style="margin:0;"></span>
+      </div>
+
+      <div class="player-list" id="training-list" style="margin-top:14px;"></div>
     </div>
 
     <!-- ---------- MATCH CENTER ---------- -->
@@ -1112,6 +1128,7 @@ function genPlayer(rng, clubId, idx){
     id: `${clubId}-${idx}`, name: `${pick(rng,FIRST_NAMES)} ${pick(rng,LAST_NAMES)}`,
     pos, overall, age, consistency, potential, form, club: clubId, value,
     number: squadNumber, mark: pick(rng, NATIONS), captain: idx===0,
+    xp: 0, // player XP — built up in the Training Room and via tournament wins
   };
 }
 
@@ -1208,7 +1225,175 @@ const state = {
   rooms: [],
   friendLobby: null,
   activeTourneyMatch: null, // {defId, stageType:'group'|'final', matchRef, userIsHomeInFixture}
+  managerXp: 0,             // grows from live two-player Quick Matches (see handleLiveEvent's full_time branch)
+  trainCooldowns: {},       // playerId -> timestamp (ms) when they're trainable again
+  squadTrainCooldownUntil: 0,
 };
+
+/* ============================================================
+   TRAINING ROOM — Player XP & Manager XP
+   Player XP is earned two ways: running drills in the Training Room,
+   or winning a tournament outright (whole squad gets a bonus payout —
+   see applyTourneyMatchResult's 'final' branch). Leveling a player up
+   nudges their `overall` one point closer to their `potential`.
+   Manager XP is earned by playing live two-player Quick Matches
+   (the real matchmade "Play vs. a Friend" flow — see handleLiveEvent's
+   'full_time' branch, which only fires manager XP when m.friendMode
+   is true, i.e. an actual opposing human, not a bot Quick Match).
+   ============================================================ */
+const XP_PER_PLAYER_LEVEL = 120;
+const XP_PER_MANAGER_LEVEL = 500;
+const TRAIN_COOLDOWN_MS = 45_000;        // per-player drill cooldown
+const SQUAD_TRAIN_COOLDOWN_MS = 120_000; // full-squad session cooldown
+const TOURNEY_WIN_PLAYER_XP = 150;
+
+function playerLevelForXp(xp){ return 1 + Math.floor((xp||0) / XP_PER_PLAYER_LEVEL); }
+function managerLevelForXp(xp){ return 1 + Math.floor((xp||0) / XP_PER_MANAGER_LEVEL); }
+
+/* Adds XP to a player, bumps `overall` (capped at potential) once per
+   level gained, and returns whether they leveled up — callers decide
+   whether/how to surface that (toast, re-render, etc). */
+function addPlayerXp(player, amount, opts){
+  opts = opts || {};
+  const beforeLevel = playerLevelForXp(player.xp || 0);
+  player.xp = (player.xp || 0) + amount;
+  const afterLevel = playerLevelForXp(player.xp);
+  const levelsGained = afterLevel - beforeLevel;
+  if (levelsGained > 0){
+    player.overall = Math.round(clamp(player.overall + levelsGained, player.overall, player.potential));
+    if (!opts.silent){
+      showToast(`⭐ ${player.name} hit Level ${afterLevel} training — overall now ${player.overall}.`);
+    }
+  }
+  return levelsGained > 0;
+}
+
+function addManagerXp(amount, reason){
+  const beforeLevel = managerLevelForXp(state.managerXp);
+  state.managerXp += amount;
+  const afterLevel = managerLevelForXp(state.managerXp);
+  showToast(`👔 +${amount} manager XP${reason ? ' — ' + reason : ''}.`);
+  if (afterLevel > beforeLevel){
+    showToast(`🎉 Manager level up! You're now Level ${afterLevel}.`);
+  }
+  updateManagerXpBadge();
+  if (state.view === 'training') renderTraining();
+}
+
+function updateManagerXpBadge(){
+  const el = document.getElementById('topbar-mgr-name');
+  if (!el) return;
+  const level = managerLevelForXp(state.managerXp);
+  const into = state.managerXp - (level-1)*XP_PER_MANAGER_LEVEL;
+  el.textContent = `Manager: ${state.managerName} · Lvl ${level} (${into}/${XP_PER_MANAGER_LEVEL} XP)`;
+}
+
+/* ---- Awards every player in the user's full squad a chunk of XP —
+   called when the user's tournament run ends in a title (see
+   applyTourneyMatchResult). ---- */
+function awardSquadTournamentXp(){
+  const squad = LEAGUE[state.club] || [];
+  squad.forEach(p => addPlayerXp(p, TOURNEY_WIN_PLAYER_XP, {silent:true}));
+  showToast(`🏆 Trophy bonus — the whole squad picked up ${TOURNEY_WIN_PLAYER_XP} XP in training.`);
+  if (state.view === 'training') renderTraining();
+}
+
+function trainPlayer(playerId){
+  const squad = LEAGUE[state.club] || [];
+  const player = squad.find(p => p.id === playerId);
+  if (!player) return;
+  const now = Date.now();
+  if ((state.trainCooldowns[playerId]||0) > now){
+    showToast(`${player.name} needs to recover before their next drill.`);
+    return;
+  }
+  const gain = Math.round(18 + Math.random()*14); // 18-32 XP per drill
+  addPlayerXp(player, gain);
+  state.trainCooldowns[playerId] = now + TRAIN_COOLDOWN_MS;
+  renderTraining();
+}
+
+function trainSquad(){
+  const now = Date.now();
+  if (state.squadTrainCooldownUntil > now){
+    showToast('The squad is still recovering from the last full session.');
+    return;
+  }
+  const squad = LEAGUE[state.club] || [];
+  let leveledUp = 0;
+  squad.forEach(p => {
+    const gain = Math.round(8 + Math.random()*8); // smaller per-player gain, whole squad at once
+    if (addPlayerXp(p, gain, {silent:true})) leveledUp++;
+  });
+  state.squadTrainCooldownUntil = now + SQUAD_TRAIN_COOLDOWN_MS;
+  showToast(`Full-squad session complete.${leveledUp ? ` ${leveledUp} player(s) leveled up.` : ''}`);
+  renderTraining();
+}
+
+function renderTraining(){
+  const mgrCard = document.getElementById('mgr-xp-card');
+  if (mgrCard){
+    const level = managerLevelForXp(state.managerXp);
+    const into = state.managerXp - (level-1)*XP_PER_MANAGER_LEVEL;
+    const pct = Math.round((into / XP_PER_MANAGER_LEVEL) * 100);
+    mgrCard.innerHTML = `
+      <div class="section-eyebrow">MANAGER PROGRESSION</div>
+      <div style="display:flex; align-items:baseline; gap:10px; margin-top:8px;">
+        <span style="font-family:var(--font-display); font-size:26px;">Level ${level}</span>
+        <span class="section-sub" style="margin:0;">${state.managerName}</span>
+      </div>
+      <div class="slot-bar" style="width:100%; margin-top:10px;"><div class="fill" style="width:${pct}%;"></div></div>
+      <div class="section-sub" style="margin-top:6px;">${into} / ${XP_PER_MANAGER_LEVEL} XP toward Level ${level+1} — earned by playing live "Play vs. a Friend" Quick Matches against real managers.</div>
+    `;
+  }
+
+  const cooldownEl = document.getElementById('train-squad-cooldown');
+  const squadBtn = document.getElementById('train-squad-btn');
+  const now = Date.now();
+  if (cooldownEl && squadBtn){
+    const remaining = state.squadTrainCooldownUntil - now;
+    if (remaining > 0){
+      squadBtn.disabled = true;
+      cooldownEl.textContent = `Recovering — ${Math.ceil(remaining/1000)}s`;
+    } else {
+      squadBtn.disabled = false;
+      cooldownEl.textContent = '';
+    }
+  }
+
+  const list = document.getElementById('training-list');
+  if (!list) return;
+  const squad = (LEAGUE[state.club] || []).slice().sort((a,b) => a.number - b.number);
+  list.innerHTML = squad.map(p => {
+    const level = playerLevelForXp(p.xp);
+    const into = p.xp - (level-1)*XP_PER_PLAYER_LEVEL;
+    const pct = Math.round((into / XP_PER_PLAYER_LEVEL) * 100);
+    const cooldown = (state.trainCooldowns[p.id]||0) - now;
+    const trainable = cooldown <= 0;
+    const atPotential = p.overall >= p.potential;
+    return `
+      <div class="card" style="display:flex; align-items:center; gap:14px; padding:12px 16px;">
+        <div style="flex:1; min-width:0;">
+          <div style="display:flex; align-items:center; gap:8px;">
+            <strong>${p.name}</strong>
+            <span class="section-sub" style="margin:0;">${p.pos} · OVR ${p.overall}${atPotential ? ' (at potential)' : ' / POT ' + p.potential}</span>
+          </div>
+          <div class="slot-bar" style="width:100%; margin-top:8px;"><div class="fill" style="width:${pct}%;"></div></div>
+          <div class="section-sub" style="margin-top:4px;">Level ${level} · ${into}/${XP_PER_PLAYER_LEVEL} XP</div>
+        </div>
+        <button class="btn btn-ghost btn-sm train-btn" data-player="${p.id}" ${trainable ? '' : 'disabled'} style="flex-shrink:0;">
+          ${trainable ? '🏋️ Train' : `⏱ ${Math.ceil(cooldown/1000)}s`}
+        </button>
+      </div>`;
+  }).join('');
+  list.querySelectorAll('.train-btn').forEach(btn => {
+    btn.addEventListener('click', () => trainPlayer(btn.dataset.player));
+  });
+}
+
+document.getElementById('train-squad-btn').addEventListener('click', trainSquad);
+// Keep cooldown timers/labels fresh while the Training view is open.
+setInterval(() => { if (state.view === 'training') renderTraining(); }, 1000);
 
 function fmtMoney(v){
   if (Math.abs(v) >= 1_000_000) return '£' + (v/1_000_000).toFixed(2) + 'M';
@@ -1461,6 +1646,7 @@ function switchView(view){
   document.querySelectorAll('.view').forEach(v => v.classList.add('hidden'));
   document.getElementById('view-'+view).classList.remove('hidden');
   document.querySelectorAll('.nav-tab').forEach(t => t.classList.toggle('active', t.dataset.view===view));
+  if (view === 'training') renderTraining();
 }
 document.querySelectorAll('.nav-tab').forEach(t => t.addEventListener('click', () => switchView(t.dataset.view)));
 document.getElementById('goto-match-btn').addEventListener('click', () => switchView('match'));
@@ -1533,6 +1719,7 @@ function openFriendMatchModal(){
           manager_name: state.managerName, home_name: club.name,
           home_squad: myStartingXI().map(toSimplePlayer),
           home_bench: homeBench.map(toSimplePlayer),
+          home_team_id: state.liveTeamId || null,
         }),
       });
       const data = await res.json();
@@ -1565,6 +1752,7 @@ function openFriendMatchModal(){
           code, manager_name: state.managerName, away_name: club.name,
           away_squad: myStartingXI().map(toSimplePlayer),
           away_bench: awayBench.map(toSimplePlayer),
+          away_team_id: state.liveTeamId || null,
         }),
       });
       const data = await res.json();
@@ -1710,7 +1898,7 @@ function connectFriendMatchSockets(matchId, side, token){
   m.matchId = matchId; m.live = true;
   const kickoffBtn = document.getElementById('sim-start-btn');
 
-  m.socket = new WebSocket(`${liveWsBase()}/ws/match/${matchId}`);
+  m.socket = new WebSocket(`${liveWsBase()}/ws/match/${matchId}?side=${side}&token=${encodeURIComponent(token)}`);
   m.tacticsSocket = new WebSocket(`${liveWsBase()}/ws/match/${matchId}/tactics?side=${side}&token=${encodeURIComponent(token)}`);
 
   m.socket.onopen = () => {
@@ -1934,6 +2122,8 @@ function bootApp(){
   renderTradeHub('outbox');
   buildTournaments();
   renderTournaments();
+  updateManagerXpBadge();
+  renderTraining();
   setupMatch();
   switchView('dugout');
 }
@@ -2620,6 +2810,7 @@ function applyTourneyMatchResult(defId, stageType, matchRef, homeScore, awayScor
       state.balance += def.prize;
       document.getElementById('balance-value').textContent = fmtMoney(state.balance);
       showToast(`Prize money ${fmtMoney(def.prize)} added to the club balance.`);
+      awardSquadTournamentXp();
     }
   }
   renderTournaments();
@@ -3367,7 +3558,7 @@ function setLiveBadge(state_, text){
   const badge = document.getElementById('live-mode-badge');
   if (!LIVE_API_BASE){ badge.style.display = 'none'; return; }
   badge.style.display = '';
-  const colors = { connecting: 'var(--floodlight)', live: '#7CC77E', error: 'var(--card-red)' };
+  const colors = { connecting: 'var(--floodlight)', live: '#7CC77E', error: 'var(--card-red)', paused: '#E8B93B' };
   badge.style.color = colors[state_] || 'var(--assist)';
   badge.textContent = text;
 }
@@ -3398,6 +3589,11 @@ async function startLiveMatch(){
           home_bench: m.homeBenchPlayers.map(toSimplePlayer),
           away_squad: m.awaySquad.map(toSimplePlayer),
           away_bench: [],
+          // Logged-in manager's persistent team — reuses/updates their
+          // real squad server-side instead of provisioning a throwaway
+          // team+players every kickoff. Anonymous/guest play (no session)
+          // omits this and keeps the old ephemeral behavior.
+          home_team_id: state.liveTeamId || null,
         }),
       });
     } catch (networkErr){
@@ -3502,12 +3698,50 @@ function handleLiveEvent(evt){
       if (remaining <= 0){ clearInterval(timer); document.getElementById('halftime-overlay').classList.add('hidden'); }
     }, 1000);
   }
+  if (evt.type === 'match_paused'){
+    // A friend-match side's socket dropped — the backend has actually
+    // stopped advancing the simulation (not just cosmetically), so freeze
+    // the UI's live badge to reflect that rather than let it keep saying
+    // "LIVE" while nothing's really moving.
+    const who = evt.side === m.mySide ? 'Your' : "Your opponent's";
+    setLiveBadge('paused', `● PAUSED — ${who} connection dropped (${Math.round(evt.grace_seconds || 45)}s to reconnect)`);
+  }
+  if (evt.type === 'match_resumed'){
+    setLiveBadge('live', m.friendMode ? '● LIVE — two-player friend match' : ('● LIVE — ' + LIVE_API_BASE.replace(/^https?:\/\//, '')));
+  }
+  if (evt.type === 'match_forfeited'){
+    m.live = false;
+    closeLiveConnections(m);
+    const iForfeited = evt.forfeited_side === m.mySide;
+    document.getElementById('sim-start-btn').textContent = iForfeited ? 'You forfeited' : 'Opponent forfeited';
+    document.getElementById('sim-start-btn').disabled = true;
+    setLiveBadge('error', iForfeited
+      ? '● Match forfeited — your connection never came back'
+      : "● Opponent's connection never came back — you win by forfeit");
+    finishActiveTourneyMatchIfAny();
+    if (m.friendMode && !m.managerXpAwarded){
+      m.managerXpAwarded = true;
+      if (evt.winning_side === m.mySide) addManagerXp(60, 'won a live match vs. another manager (opponent forfeited)');
+    }
+  }
   if (evt.type === 'full_time'){
     m.live = false;
     closeLiveConnections(m);
     document.getElementById('sim-start-btn').textContent = 'Match complete';
     document.getElementById('sim-start-btn').disabled = true;
     finishActiveTourneyMatchIfAny();
+    // Live, real two-player "Play vs. a Friend" Quick Match — this is the
+    // only match type with an actual opposing manager, so it's the only
+    // one that pays out manager XP (bot Quick Matches and tournament AI
+    // fixtures don't).
+    if (m.friendMode && !m.managerXpAwarded){
+      m.managerXpAwarded = true;
+      const myScore = m.mySide === 'away' ? m.awayScore : m.homeScore;
+      const oppScore = m.mySide === 'away' ? m.homeScore : m.awayScore;
+      if (myScore > oppScore) addManagerXp(60, 'won a live match vs. another manager');
+      else if (myScore === oppScore) addManagerXp(25, 'drew a live match vs. another manager');
+      else addManagerXp(15, 'played a live match vs. another manager');
+    }
   }
   updateMatchUI();
   updateSubsCounter();
