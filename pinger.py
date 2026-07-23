@@ -5,7 +5,7 @@ import urllib.error
 from datetime import datetime
 
 # URL to ping — checks environment variable 'RENDER_API_URL' first, otherwise uses fallback
-TARGET_URL = os.getenv("RENDER_API_URL", "https://touchlinee.onrender.com/health")
+TARGET_URL = os.getenv("RENDER_API_URL", "https://your-api-name.onrender.com/health")
 
 
 def ping_api(url: str) -> None:
