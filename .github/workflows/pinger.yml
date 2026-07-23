@@ -1,0 +1,33 @@
+name: Render Keep-Alive Pinger
+
+on:
+  schedule:
+    # Active Window: ~06:00 AM IST to 10:00 PM IST (00:30 UTC to 16:30 UTC)
+    # Silent Window: 10:00 PM IST to 06:00 AM IST
+    # Runs roughly every 1 hour and 45 minutes during active hours:
+    - cron: '30 0,7,14 * * *'    # 00:30, 07:30, 14:30 UTC (06:00 AM, 01:00 PM, 08:00 PM IST)
+    - cron: '15 2,9,16 * * *'    # 02:15, 09:15, 16:15 UTC (07:45 AM, 02:45 PM, 09:45 PM IST)
+    - cron: '0 4,11 * * *'       # 04:00, 11:00 UTC       (09:30 AM, 04:30 PM IST)
+    - cron: '45 5,12 * * *'      # 05:45, 12:45 UTC       (11:15 AM, 06:15 PM IST)
+
+  # Allows manually triggering the script from the Actions tab
+  workflow_dispatch:
+
+jobs:
+  run-pinger:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Run Pinger Script
+        env:
+          RENDER_API_URL: ${{ secrets.RENDER_API_URL }}
+        run: |
+          python pinger.py
