@@ -6,10 +6,10 @@
 <title>TOUCHLINE — Manager Console</title>
 
 <!-- PWA -->
-<link rel="manifest" href="./manifest.json" />
+<link rel="manifest" href="manifest.json" />
 <meta name="theme-color" content="#0D0E12" />
-<link rel="icon" href="./icon.svg" type="image/svg+xml" />
-<link rel="apple-touch-icon" href="./icon.svg" />
+<link rel="icon" href="icon.svg" type="image/svg+xml" />
+<link rel="apple-touch-icon" href="icon.svg" />
 <meta name="mobile-web-app-capable" content="yes" />
 <meta name="apple-mobile-web-app-capable" content="yes" />
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
@@ -529,7 +529,7 @@ button{font-family:var(--font-body);cursor:pointer;}
   background:rgba(6,20,15,0.88); backdrop-filter:blur(3px); border-radius:var(--radius);
   animation: view-in .25s ease-out both;
 }
-.ht-card{ text-align:center; max-width:400px; padding:24px; }
+.ht-card{ text-align:center; max-width:460px; padding:24px; }
 .ht-score{ font-family:var(--font-display); font-size:56px; margin:8px 0; }
 .ht-countdown{ font-family:var(--font-mono); color:var(--floodlight); font-size:14px; margin-bottom:14px; }
 .ht-hint{ color:var(--chalk-dim); font-size:12.5px; line-height:1.5; margin-bottom:18px; }
@@ -987,7 +987,23 @@ button{font-family:var(--font-body);cursor:pointer;}
             <div class="ht-score" id="ht-score">0 – 0</div>
             <div class="ht-countdown"><span id="ht-countdown-num">20</span>s until kickoff</div>
             <p class="ht-hint">This is your window — swap in fresh legs before the second half starts. Changes apply immediately and affect every duel from here on.</p>
-            <div class="ht-actions">
+
+            <div class="ht-strategy">
+              <div class="section-eyebrow" style="margin-top:2px;">SET YOUR MENTALITY</div>
+              <div class="filter-row" id="ht-mentality-row" style="justify-content:center; margin-top:8px; margin-bottom:0;">
+                <button class="scout-pill" data-ht-mentality="-1">Defensive</button>
+                <button class="scout-pill" data-ht-mentality="0">Balanced</button>
+                <button class="scout-pill active" data-ht-mentality="1">Attacking</button>
+              </div>
+              <div class="section-eyebrow" style="margin-top:14px;">TEAM TALK</div>
+              <div class="filter-row" id="ht-teamtalk-row" style="justify-content:center; margin-top:8px; margin-bottom:0;">
+                <button class="scout-pill" data-ht-talk="rev">🔥 Fire them up</button>
+                <button class="scout-pill" data-ht-talk="steady">Steady as you go</button>
+                <button class="scout-pill" data-ht-talk="calm">😌 Calm the nerves</button>
+              </div>
+            </div>
+
+            <div class="ht-actions" style="margin-top:18px;">
               <button class="btn btn-primary btn-sm" id="ht-sub-btn">Make a substitution</button>
               <button class="btn btn-ghost btn-sm" id="ht-start-btn">Start second half now →</button>
             </div>
@@ -4101,14 +4117,50 @@ function showHalftimeOverlay(){
   const m = state.match;
   document.getElementById('ht-score').textContent = `${m.homeScore} – ${m.awayScore}`;
   document.getElementById('halftime-overlay').classList.remove('hidden');
+  // Reflect whatever mentality was already active (set live, mid-match,
+  // via the top-bar mentality-btn) so the half-time panel doesn't silently
+  // disagree with the button — and clear any team-talk pick from a
+  // previous half (there's only ever one halftime break, but this keeps
+  // the state honest if triggerHalftimeBreak somehow fires twice).
+  document.querySelectorAll('#ht-mentality-row [data-ht-mentality]').forEach(b => {
+    b.classList.toggle('active', Number(b.dataset.htMentality) === m.mentality);
+  });
+  document.querySelectorAll('#ht-teamtalk-row [data-ht-talk]').forEach(b => b.classList.remove('active'));
+  htTeamTalkChoice = null;
 }
 function hideHalftimeOverlay(){
   document.getElementById('halftime-overlay').classList.add('hidden');
 }
+function setHalftimeMentality(val){
+  const m = state.match;
+  m.mentality = val;
+  document.querySelectorAll('#ht-mentality-row [data-ht-mentality]').forEach(b => {
+    b.classList.toggle('active', Number(b.dataset.htMentality) === val);
+  });
+  // Keep the live top-bar toggle's label in sync too, since they share the
+  // same m.mentality value — whichever one you touch next reads the truth.
+  document.getElementById('mentality-btn').textContent =
+    'Push mentality: ' + (val > 0 ? 'attacking' : val < 0 ? 'defensive' : 'balanced');
+}
+let htTeamTalkChoice = null; // 'rev' | 'steady' | 'calm' | null — applied once, at kickoff of the 2nd half
 function resumeSecondHalf(){
   const m = state.match;
   if (m.halftimeInterval){ clearInterval(m.halftimeInterval); m.halftimeInterval = null; }
   hideHalftimeOverlay();
+  // The team talk is a one-off momentum nudge in whichever direction favors
+  // YOUR side specifically (mySide() — a friend-match guest controls away,
+  // so "fire them up" should push momentum negative for them, not positive).
+  const favor = mySide() === 'away' ? -1 : 1;
+  if (htTeamTalkChoice === 'rev'){
+    m.momentum = clamp(m.momentum + favor*0.25, -1, 1);
+    pushEvent('The gaffer fires the dressing room up at the break.', '', m.minute);
+  } else if (htTeamTalkChoice === 'calm'){
+    m.momentum *= 0.25;
+    pushEvent('A calm word at the break resets the game to a clean slate.', '', m.minute);
+  } else if (htTeamTalkChoice === 'steady'){
+    pushEvent('Steady as you go — no changes at the break.', '', m.minute);
+  }
+  htTeamTalkChoice = null;
   m.running = true;
   pushEvent('Second half under way.', '', m.minute);
   simTick();
@@ -4556,6 +4608,15 @@ function openSubDrawer(){
 document.getElementById('sub-btn').addEventListener('click', openSubDrawer);
 document.getElementById('ht-sub-btn').addEventListener('click', openSubDrawer);
 document.getElementById('ht-start-btn').addEventListener('click', resumeSecondHalf);
+document.querySelectorAll('#ht-mentality-row [data-ht-mentality]').forEach(btn => {
+  btn.addEventListener('click', () => setHalftimeMentality(Number(btn.dataset.htMentality)));
+});
+document.querySelectorAll('#ht-teamtalk-row [data-ht-talk]').forEach(btn => {
+  btn.addEventListener('click', () => {
+    htTeamTalkChoice = btn.dataset.htTalk;
+    document.querySelectorAll('#ht-teamtalk-row [data-ht-talk]').forEach(b => b.classList.toggle('active', b===btn));
+  });
+});
 document.getElementById('tourney-return-btn').addEventListener('click', () => {
   document.getElementById('tourney-return-btn').classList.add('hidden', 'btn-glow');
   document.getElementById('tourney-fixture-tag').classList.add('hidden');
