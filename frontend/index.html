@@ -716,6 +716,7 @@ button{font-family:var(--font-body);cursor:pointer;}
         <button class="nav-tab" data-view="market">Transfer Market</button>
         <button class="nav-tab" data-view="scouting">Scouting</button>
         <button class="nav-tab" data-view="tournaments">Tournaments</button>
+        <button class="nav-tab" data-view="league">League</button>
         <button class="nav-tab" data-view="training">Training</button>
         <button class="nav-tab" data-view="match">Match Center</button>
       </div>
@@ -869,6 +870,32 @@ button{font-family:var(--font-body);cursor:pointer;}
       </div>
     </div>
 
+    <!-- ---------- LEAGUE (persistent career: seasons + promotion/relegation) ---------- -->
+    <div class="view hidden" id="view-league">
+      <div class="section-title"><h2>League</h2></div>
+      <p class="section-sub" id="league-season-sub">A real table across a full season, not one-off matches — win promotion, avoid the drop, and it all picks up where you left off next time you open the app.</p>
+
+      <div class="card" id="league-matchday-card" style="margin-bottom:16px;"></div>
+
+      <div class="market-layout">
+        <div class="card">
+          <div class="filter-row">
+            <button class="scout-pill active" data-league-div="mine">My Division</button>
+            <button class="scout-pill" data-league-div="other">Other Division</button>
+          </div>
+          <div class="section-eyebrow" id="league-table-title" style="margin-top:4px;">STANDINGS</div>
+          <table class="group-table" id="league-standings-table" style="margin-top:10px;">
+            <thead><tr><th>#</th><th>Club</th><th>P</th><th>W-D-L</th><th>GF-GA</th><th>GD</th><th>Pts</th></tr></thead>
+            <tbody id="league-standings-body"></tbody>
+          </table>
+        </div>
+        <div class="card">
+          <div class="section-eyebrow">FIXTURES — THIS DIVISION</div>
+          <div id="league-fixture-list" style="margin-top:10px;"></div>
+        </div>
+      </div>
+    </div>
+
     <!-- ---------- TRAINING ROOM ---------- -->
     <div class="view hidden" id="view-training">
       <div class="section-title"><h2>Training Room</h2></div>
@@ -891,6 +918,7 @@ button{font-family:var(--font-body);cursor:pointer;}
 
       <div class="card" style="position:relative;">
         <div id="tourney-fixture-tag" class="fixture-tag hidden"><span class="dot"></span><span id="tourney-fixture-tag-text">TOURNAMENT FIXTURE</span></div>
+        <div id="season-fixture-tag" class="fixture-tag hidden"><span class="dot"></span><span id="season-fixture-tag-text">SEASON FIXTURE</span></div>
         <div class="scoreboard">
           <div class="sb-team" id="sb-home"></div>
           <div>
@@ -924,6 +952,7 @@ button{font-family:var(--font-body);cursor:pointer;}
           <button class="btn btn-ghost btn-sm" id="sub-btn">Make a substitution</button>
           <button class="btn btn-ghost btn-sm" id="live-trade-btn" style="display:none;">🔁 Live Trade <span id="live-trade-badge" style="display:none;"></span></button>
           <button class="btn btn-primary btn-sm hidden" id="tourney-return-btn">🏆 Return to Tournament →</button>
+          <button class="btn btn-primary btn-sm hidden" id="league-return-btn">📋 Return to League →</button>
           <span class="subs-counter" id="subs-counter">Subs: 0/5</span>
           <span class="subs-counter" id="live-mode-badge" style="display:none;"></span>
         </div>
@@ -974,6 +1003,7 @@ button{font-family:var(--font-body);cursor:pointer;}
             <div class="ft-actions">
               <button class="btn btn-primary btn-sm" id="ft-rematch-btn">⚡ Play another Quick Match</button>
               <button class="btn btn-ghost btn-sm hidden" id="ft-tourney-btn">🏆 Return to Tournament →</button>
+              <button class="btn btn-ghost btn-sm hidden" id="ft-league-btn">📋 Return to League →</button>
               <button class="btn btn-ghost btn-sm" id="ft-dugout-btn">Back to Dugout</button>
             </div>
           </div>
@@ -1391,6 +1421,8 @@ const state = {
   rooms: [],
   friendLobby: null,
   activeTourneyMatch: null, // {defId, stageType:'group'|'final', matchRef, userIsHomeInFixture}
+  career: null,              // {seasonNumber, currentRound, divisions:{0:{...},1:{...}}} — see ensureCareer()
+  activeSeasonFixture: null, // {fixture, userIsHome} while playing a League matchday fixture live
   managerXp: 0,             // grows from live two-player Quick Matches (see handleLiveEvent's full_time branch)
   trainCooldowns: {},       // playerId -> timestamp (ms) when they're trainable again
   squadTrainCooldownUntil: 0,
@@ -1814,6 +1846,7 @@ function switchView(view){
   document.querySelectorAll('.nav-tab').forEach(t => t.classList.toggle('active', t.dataset.view===view));
   if (view === 'training') renderTraining();
   if (view === 'scouting') renderScouting();
+  if (view === 'league') renderLeague();
 }
 document.querySelectorAll('.nav-tab').forEach(t => t.addEventListener('click', () => switchView(t.dataset.view)));
 document.getElementById('goto-match-btn').addEventListener('click', () => switchView('match'));
@@ -1996,8 +2029,11 @@ function connectFriendLobbySocket(backdrop, showStatus){
 function beginFriendMatch(kickoff){
   closeLiveConnections(state.match);
   state.activeTourneyMatch = null;
+  state.activeSeasonFixture = null;
   document.getElementById('tourney-fixture-tag').classList.add('hidden');
   document.getElementById('tourney-return-btn').classList.add('hidden', 'btn-glow');
+  document.getElementById('season-fixture-tag').classList.add('hidden');
+  document.getElementById('league-return-btn').classList.add('hidden', 'btn-glow');
   const mySide = kickoff.your_side; // 'home' | 'away'
   const club = CLUBS.find(c=>c.id===state.club);
   initLineupIfNeeded();
@@ -2404,6 +2440,8 @@ function bootApp(){
   renderTradeHub('outbox');
   buildTournaments();
   renderTournaments();
+  ensureCareer();
+  renderLeague();
   updateManagerXpBadge();
   renderTraining();
   setupMatch();
@@ -3450,6 +3488,313 @@ document.getElementById('join-code-btn').addEventListener('click', () => {
 });
 
 /* ============================================================
+   LEAGUE — persistent manager career: seasons, a real table, and
+   promotion/relegation, instead of one-off matches.
+
+   Two divisions (CLUBS' own `division: 0|1` field seeds season 1's
+   membership), 6 clubs each. Each season is a single round-robin
+   (circle method: 5 matchdays, 3 fixtures each, every pair meets once)
+   per division. Both divisions always advance in lockstep by matchday —
+   whichever fixtures in the current round don't involve you resolve
+   instantly via quickSimResult() the moment you play or sim your own, so
+   the table always reflects a fully-played round, never a half one.
+
+   Persisted to localStorage (`touchline_career_v1`) so the season/table
+   survives a page reload — the one piece of this client-only demo's state
+   that's meant to actually carry over, unlike LEAGUE (regenerated fresh
+   each load) or state.tournaments (memory-only).
+   ============================================================ */
+const CAREER_STORAGE_KEY = 'touchline_career_v1';
+const DIVISION_NAMES = {0: 'Division 1', 1: 'Division 2'};
+const PROMOTE_RELEGATE_COUNT = 2; // top N of Div 2 up, bottom N of Div 1 down
+
+function makeRoundRobinFixtures(clubIds){
+  // Circle method: fix one club, rotate the rest around it each round.
+  // n-1 rounds, n/2 matches per round, every pair meets exactly once.
+  // Home/away alternates by round parity so it's not lopsided toward
+  // whichever half of the rotation a club started in.
+  let ids = clubIds.slice();
+  if (ids.length % 2 !== 0) ids.push(null); // odd division size -> a bye slot
+  const n = ids.length;
+  const fixed = ids[0];
+  let rotating = ids.slice(1);
+  const fixtures = [];
+  for (let r = 0; r < n - 1; r++){
+    const roundIds = [fixed, ...rotating];
+    for (let i = 0; i < n / 2; i++){
+      const a = roundIds[i], b = roundIds[n - 1 - i];
+      if (a == null || b == null) continue; // bye
+      const home = (r % 2 === 0) ? a : b;
+      const away = (r % 2 === 0) ? b : a;
+      fixtures.push({round: r, home, away, homeScore: null, awayScore: null, played: false});
+    }
+    rotating = [rotating[rotating.length - 1], ...rotating.slice(0, -1)];
+  }
+  return fixtures;
+}
+
+function initialDivisionAssignment(){
+  const byDiv = {0: [], 1: []};
+  CLUBS.forEach(c => byDiv[c.division === 1 ? 1 : 0].push(c.id));
+  return byDiv;
+}
+
+function newSeasonState(seasonNumber, clubDivisions){
+  const divisions = {};
+  Object.keys(clubDivisions).forEach(dKey => {
+    divisions[dKey] = { clubIds: clubDivisions[dKey].slice(), fixtures: makeRoundRobinFixtures(clubDivisions[dKey]) };
+  });
+  return { seasonNumber, currentRound: 0, divisions };
+}
+
+function saveCareer(){
+  try { localStorage.setItem(CAREER_STORAGE_KEY, JSON.stringify(state.career)); } catch(e){ /* storage unavailable — career just won't survive a reload */ }
+}
+
+function loadCareer(){
+  try {
+    const raw = localStorage.getItem(CAREER_STORAGE_KEY);
+    return raw ? JSON.parse(raw) : null;
+  } catch(e){ return null; }
+}
+
+function ensureCareer(){
+  if (state.career) return;
+  const existing = loadCareer();
+  // A saved career is only reusable if it actually has both current
+  // divisions' worth of real clubs (the demo's CLUBS list is static, but
+  // this guards against a stale save from before a CLUBS edit).
+  const validSaved = existing && existing.divisions && existing.divisions[0] && existing.divisions[1]
+    && existing.divisions[0].clubIds.every(id => CLUBS.some(c=>c.id===id))
+    && existing.divisions[1].clubIds.every(id => CLUBS.some(c=>c.id===id));
+  state.career = validSaved ? existing : newSeasonState(1, initialDivisionAssignment());
+  if (!validSaved) saveCareer();
+}
+
+function myDivisionKey(){
+  const divs = state.career.divisions;
+  return Object.keys(divs).find(d => divs[d].clubIds.includes(state.club)) || '0';
+}
+
+/* Standard football table sort: points, then goal difference, then goals
+   scored — same tiebreak order groupStandings() uses for tournament
+   groups, generalized here to also carry GF/GA separately for display. */
+function standingsTable(clubIds, fixtures){
+  const table = {};
+  clubIds.forEach(id => table[id] = {id, played:0, w:0, d:0, l:0, gf:0, ga:0, pts:0});
+  fixtures.forEach(f => {
+    if (!f.played) return;
+    const h = table[f.home], a = table[f.away];
+    if (!h || !a) return;
+    h.played++; a.played++;
+    h.gf += f.homeScore; h.ga += f.awayScore;
+    a.gf += f.awayScore; a.ga += f.homeScore;
+    if (f.homeScore > f.awayScore){ h.w++; h.pts+=3; a.l++; }
+    else if (f.homeScore < f.awayScore){ a.w++; a.pts+=3; h.l++; }
+    else { h.d++; a.d++; h.pts++; a.pts++; }
+  });
+  return Object.values(table).sort((x,y) => y.pts-x.pts || (y.gf-y.ga)-(x.gf-x.ga) || y.gf-x.gf);
+}
+
+function totalRoundsInSeason(){
+  const anyDiv = Object.values(state.career.divisions)[0];
+  return anyDiv ? new Set(anyDiv.fixtures.map(f=>f.round)).size : 5;
+}
+
+/* ---- Applying a result & advancing the calendar ----
+   A single "matchday" always resolves for BOTH divisions together: the
+   fixture the user actually played (or chose to sim) plus every other
+   still-unplayed fixture in the current round, auto-resolved instantly via
+   quickSimResult(). That keeps both tables perfectly in lockstep — there's
+   never a round that's half-played — and means season-end (all rounds
+   complete) is a single, unambiguous moment to check for. ---- */
+function applyFixtureResult(fixture, homeScore, awayScore){
+  fixture.homeScore = homeScore; fixture.awayScore = awayScore; fixture.played = true;
+}
+
+function advanceMatchday(){
+  const round = state.career.currentRound;
+  Object.values(state.career.divisions).forEach(div => {
+    div.fixtures.filter(f => f.round === round && !f.played).forEach(f => {
+      const r = quickSimResult(f.home, f.away);
+      applyFixtureResult(f, r.homeScore, r.awayScore);
+    });
+  });
+  state.career.currentRound++;
+  if (state.career.currentRound >= totalRoundsInSeason()){
+    endOfSeason();
+  } else {
+    saveCareer();
+  }
+}
+
+function endOfSeason(){
+  const divs = state.career.divisions;
+  const topTable = standingsTable(divs[0].clubIds, divs[0].fixtures);
+  const bottomTable = standingsTable(divs[1].clubIds, divs[1].fixtures);
+
+  const relegated = topTable.slice(-PROMOTE_RELEGATE_COUNT).map(r=>r.id);
+  const promoted = bottomTable.slice(0, PROMOTE_RELEGATE_COUNT).map(r=>r.id);
+  const champion = topTable[0].id;
+
+  const newDiv0 = topTable.filter(r=>!relegated.includes(r.id)).map(r=>r.id).concat(promoted);
+  const newDiv1 = bottomTable.filter(r=>!promoted.includes(r.id)).map(r=>r.id).concat(relegated);
+
+  const summary = {
+    seasonNumber: state.career.seasonNumber, champion,
+    promoted, relegated,
+    userPromoted: promoted.includes(state.club), userRelegated: relegated.includes(state.club),
+  };
+
+  state.career = newSeasonState(state.career.seasonNumber + 1, {0: newDiv0, 1: newDiv1});
+  saveCareer();
+  showSeasonSummary(summary);
+}
+
+function showSeasonSummary(summary){
+  const champClub = CLUBS.find(c=>c.id===summary.champion);
+  const promotedNames = summary.promoted.map(id => CLUBS.find(c=>c.id===id).name).join(', ');
+  const relegatedNames = summary.relegated.map(id => CLUBS.find(c=>c.id===id).name).join(', ');
+  const backdrop = document.createElement('div');
+  backdrop.className = 'drawer-backdrop';
+  backdrop.innerHTML = `
+    <div class="drawer">
+      <button class="btn btn-ghost btn-sm drawer-close" id="ss-close">Close</button>
+      <h3>Season ${summary.seasonNumber} complete</h3>
+      <div class="drawer-sub">🏆 Champions: <b>${champClub.name}</b>${summary.champion===state.club?' — that\'s you!':''}</div>
+      <div class="offer-terms" style="margin-top:14px;">⬆️ Promoted to Division 1: <b>${promotedNames}</b>${summary.userPromoted?' — congratulations, that\'s your club!':''}</div>
+      <div class="offer-terms" style="margin-top:8px;">⬇️ Relegated to Division 2: <b>${relegatedNames}</b>${summary.userRelegated?' — tough break, that\'s your club.':''}</div>
+      <div class="drawer-sub" style="margin-top:14px;">Season ${summary.seasonNumber+1} kicks off now — fresh fixtures, table reset to zero.</div>
+      <button class="btn btn-primary" style="width:100%; margin-top:16px;" id="ss-ok">Got it →</button>
+    </div>`;
+  document.body.appendChild(backdrop);
+  const close = () => { if (document.body.contains(backdrop)) document.body.removeChild(backdrop); renderLeague(); };
+  backdrop.querySelector('#ss-close').addEventListener('click', close);
+  backdrop.querySelector('#ss-ok').addEventListener('click', close);
+  backdrop.addEventListener('click', (e) => { if (e.target===backdrop) close(); });
+}
+
+/* ---- Playing your own fixture live in the Match Center, mirroring the
+   tournament flow (launchTourneyMatch / finishActiveTourneyMatchIfAny). ---- */
+function playSeasonFixture(fixture){
+  const userIsHome = fixture.home === state.club;
+  const oppId = userIsHome ? fixture.away : fixture.home;
+  setupMatch(oppId);
+  state.activeSeasonFixture = { fixture, userIsHome };
+  const tag = document.getElementById('season-fixture-tag');
+  tag.classList.remove('hidden');
+  document.getElementById('season-fixture-tag-text').textContent =
+    `SEASON ${state.career.seasonNumber} — MATCHDAY ${state.career.currentRound+1} OF ${totalRoundsInSeason()}`;
+  switchView('match');
+  showToast(`Matchday ${state.career.currentRound+1} — kick off when you're ready.`);
+}
+
+function finishActiveSeasonFixtureIfAny(){
+  const active = state.activeSeasonFixture;
+  if (!active) return;
+  const m = state.match;
+  const homeScore = active.userIsHome ? m.homeScore : m.awayScore;
+  const awayScore = active.userIsHome ? m.awayScore : m.homeScore;
+  state.activeSeasonFixture = null;
+  applyFixtureResult(active.fixture, homeScore, awayScore);
+  advanceMatchday();
+  document.getElementById('league-return-btn').classList.remove('hidden', 'btn-glow');
+  void document.getElementById('league-return-btn').offsetWidth; // restart the pulse animation
+  document.getElementById('league-return-btn').classList.add('btn-glow');
+}
+
+/* "Sim this match & advance" — resolves the user's own fixture instantly
+   (same quickSimResult() path as every other fixture) instead of playing
+   it live, then advances the whole matchday exactly like the live path. */
+function simFixtureAndAdvance(fixture){
+  const r = quickSimResult(fixture.home, fixture.away);
+  applyFixtureResult(fixture, r.homeScore, r.awayScore);
+  const home = CLUBS.find(c=>c.id===fixture.home), away = CLUBS.find(c=>c.id===fixture.away);
+  showToast(`${home.name} ${r.homeScore}-${r.awayScore} ${away.name}`);
+  advanceMatchday();
+  renderLeague();
+}
+
+let leagueDivView = 'mine';
+function renderLeague(){
+  ensureCareer();
+  const myDiv = myDivisionKey();
+  const viewDiv = leagueDivView === 'mine' ? myDiv : (myDiv === '0' ? '1' : '0');
+  const division = state.career.divisions[viewDiv];
+  const round = state.career.currentRound;
+  const totalRounds = totalRoundsInSeason();
+
+  document.getElementById('league-season-sub').textContent =
+    `Season ${state.career.seasonNumber} — ${DIVISION_NAMES[myDiv]}, Matchday ${Math.min(round+1, totalRounds)} of ${totalRounds}. Win promotion, avoid the drop.`;
+
+  // ---- Matchday action panel ----
+  const myDivision = state.career.divisions[myDiv];
+  const myFixture = myDivision.fixtures.find(f => f.round === round && (f.home===state.club || f.away===state.club));
+  const card = document.getElementById('league-matchday-card');
+  if (!myFixture){
+    card.innerHTML = `<div class="empty-note">No fixture found for this matchday — try refreshing the League tab.</div>`;
+  } else {
+    const opp = CLUBS.find(c=>c.id === (myFixture.home===state.club ? myFixture.away : myFixture.home));
+    const atHome = myFixture.home === state.club;
+    card.innerHTML = `
+      <div class="section-eyebrow">SEASON ${state.career.seasonNumber} · MATCHDAY ${round+1} OF ${totalRounds}</div>
+      <div class="drawer-sub" style="margin-top:6px;">${atHome ? 'Home' : 'Away'} vs. <b>${opp.name}</b></div>
+      <div class="tourney-actions-row" style="margin-top:12px;">
+        <button class="btn btn-primary btn-sm" id="league-play-btn">⚽ Play this match →</button>
+        <button class="btn btn-ghost btn-sm" id="league-sim-btn">⏭ Sim this match &amp; advance</button>
+      </div>`;
+    card.querySelector('#league-play-btn').addEventListener('click', () => playSeasonFixture(myFixture));
+    card.querySelector('#league-sim-btn').addEventListener('click', () => simFixtureAndAdvance(myFixture));
+  }
+
+  // ---- Standings table ----
+  document.getElementById('league-table-title').textContent =
+    `${DIVISION_NAMES[viewDiv]} STANDINGS${viewDiv===myDiv ? '' : ' (not your division)'}`;
+  const table = standingsTable(division.clubIds, division.fixtures);
+  document.getElementById('league-standings-body').innerHTML = table.map((r, i) => `
+    <tr class="${r.id===state.club?'gp-you':''}">
+      <td>${i+1}</td>
+      <td>${CLUBS.find(c=>c.id===r.id).name}${r.id===state.club?' (you)':''}</td>
+      <td>${r.played}</td><td>${r.w}-${r.d}-${r.l}</td><td>${r.gf}-${r.ga}</td>
+      <td>${r.gf-r.ga>=0?'+':''}${r.gf-r.ga}</td><td>${r.pts}</td>
+    </tr>`).join('');
+
+  // ---- Fixture list ----
+  const fixturesByRound = {};
+  division.fixtures.forEach(f => { (fixturesByRound[f.round] = fixturesByRound[f.round]||[]).push(f); });
+  document.getElementById('league-fixture-list').innerHTML = Object.keys(fixturesByRound).sort((a,b)=>a-b).map(r => `
+    <div style="margin-bottom:10px;">
+      <div class="section-eyebrow" style="font-size:9.5px;">MATCHDAY ${Number(r)+1}${Number(r)===round ? ' — CURRENT' : ''}</div>
+      ${fixturesByRound[r].map(f => {
+        const h = CLUBS.find(c=>c.id===f.home), a = CLUBS.find(c=>c.id===f.away);
+        const involvesYou = f.home===state.club || f.away===state.club;
+        const score = f.played ? `${f.homeScore} – ${f.awayScore}` : 'vs';
+        return `<div class="offer-terms" style="display:flex; justify-content:space-between; padding:4px 0; ${involvesYou?'color:var(--floodlight); font-weight:600;':''}">
+          <span>${h.name}</span><span style="margin:0 8px;">${score}</span><span>${a.name}</span>
+        </div>`;
+      }).join('')}
+    </div>`).join('');
+}
+
+document.querySelectorAll('[data-league-div]').forEach(btn => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('[data-league-div]').forEach(b=>b.classList.remove('active'));
+    btn.classList.add('active');
+    leagueDivView = btn.dataset.leagueDiv;
+    renderLeague();
+  });
+});
+document.getElementById('league-return-btn').addEventListener('click', () => {
+  document.getElementById('league-return-btn').classList.add('hidden', 'btn-glow');
+  document.getElementById('season-fixture-tag').classList.add('hidden');
+  switchView('league');
+});
+document.getElementById('ft-league-btn').addEventListener('click', () => {
+  document.getElementById('fulltime-overlay').classList.add('hidden');
+  document.getElementById('league-return-btn').click();
+});
+
+/* ============================================================
    MATCH CENTER — client-side mirror of engine/match_engine.py:
    Gaussian rolls, a chaos d100, and a decaying momentum tug-of-war.
    ============================================================ */
@@ -3549,8 +3894,11 @@ const MAX_SUBS = 5;
 function setupMatch(opponentId){
   closeLiveConnections(state.match);
   state.activeTourneyMatch = null;
+  state.activeSeasonFixture = null;
   document.getElementById('tourney-fixture-tag').classList.add('hidden');
   document.getElementById('tourney-return-btn').classList.add('hidden', 'btn-glow');
+  document.getElementById('season-fixture-tag').classList.add('hidden');
+  document.getElementById('league-return-btn').classList.add('hidden', 'btn-glow');
   const club = CLUBS.find(c=>c.id===state.club);
   const away = opponentId ? CLUBS.find(c=>c.id===opponentId) : CLUBS.find(c=>c.id!==state.club);
   document.getElementById('sb-home').innerHTML = `<div class="badge" style="${crestStyle(club)}">${initials(club.name)}</div><div class="nm">${club.name}</div>`;
@@ -3629,14 +3977,22 @@ function showFullTimeOverlay(opts){
     subEl.textContent = `${homeName} ${homeScore} – ${awayScore} ${awayName}.`;
   }
 
-  // The tournament return button only makes sense mid-tournament-fixture —
-  // finishActiveTourneyMatchIfAny() clears state.activeTourneyMatch before
-  // this runs, so check the visible nav button instead of the state flag.
+  // The tournament/league return buttons only make sense right after that
+  // specific fixture type — finishActiveTourneyMatchIfAny()/
+  // finishActiveSeasonFixtureIfAny() clear their state flags before this
+  // runs, so check the visible nav button instead.
   const tourneyNavBtn = document.getElementById('tourney-return-btn');
   if (tourneyNavBtn && !tourneyNavBtn.classList.contains('hidden')){
     tourneyBtn.classList.remove('hidden');
   } else {
     tourneyBtn.classList.add('hidden');
+  }
+  const leagueBtn = document.getElementById('ft-league-btn');
+  const leagueNavBtn = document.getElementById('league-return-btn');
+  if (leagueNavBtn && !leagueNavBtn.classList.contains('hidden')){
+    leagueBtn.classList.remove('hidden');
+  } else {
+    leagueBtn.classList.add('hidden');
   }
 
   document.getElementById('fulltime-overlay').classList.remove('hidden');
@@ -3887,6 +4243,7 @@ function simTick(){
     document.getElementById('sim-start-btn').textContent='Match complete';
     document.getElementById('sim-start-btn').disabled=true;
     finishActiveTourneyMatchIfAny();
+    finishActiveSeasonFixtureIfAny();
     showFullTimeOverlay();
     return;
   }
@@ -4069,6 +4426,7 @@ function handleLiveEvent(evt){
       ? '● Match forfeited — your connection never came back'
       : "● Opponent's connection never came back — you win by forfeit");
     finishActiveTourneyMatchIfAny();
+    finishActiveSeasonFixtureIfAny();
     if (m.friendMode && !m.managerXpAwarded){
       m.managerXpAwarded = true;
       if (evt.winning_side === m.mySide) addManagerXp(60, 'won a live match vs. another manager (opponent forfeited)');
@@ -4089,6 +4447,7 @@ function handleLiveEvent(evt){
     document.getElementById('sim-start-btn').textContent = 'Match complete';
     document.getElementById('sim-start-btn').disabled = true;
     finishActiveTourneyMatchIfAny();
+    finishActiveSeasonFixtureIfAny();
     // Live, real two-player "Play vs. a Friend" Quick Match — this is the
     // only match type with an actual opposing manager, so it's the only
     // one that pays out manager XP (bot Quick Matches and tournament AI
