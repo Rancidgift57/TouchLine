@@ -8,7 +8,7 @@
 <!-- PWA -->
 <link rel="manifest" href="./manifest.json" />
 <meta name="theme-color" content="#0D0E12" />
-<link rel="icon" href="icon.svg" type="image/svg+xml" />
+<link rel="icon" href="./icon.svg" type="image/svg+xml" />
 <link rel="apple-touch-icon" href="./icon.svg" />
 <meta name="mobile-web-app-capable" content="yes" />
 <meta name="apple-mobile-web-app-capable" content="yes" />
@@ -665,7 +665,7 @@ button{font-family:var(--font-body);cursor:pointer;}
           </div>
           <div class="field">
             <label for="login-password">Password</label>
-            <input id="login-password" type="password" placeholder="••••••••" value="123456" />
+            <input id="login-password" type="password" placeholder="••••••••" value="touchline" />
           </div>
           <div class="auth-error hidden" id="login-error"></div>
           <button class="btn btn-primary" id="login-btn">Log in →</button>
@@ -741,6 +741,7 @@ button{font-family:var(--font-body);cursor:pointer;}
           <button class="btn btn-primary" style="margin-top:18px;" id="goto-match-btn">Go to Match Center →</button>
           <button class="btn btn-ghost" style="margin-top:8px; width:100%;" id="quick-match-btn">⚡ Quick Match — play now vs. a random side</button>
           <button class="btn btn-ghost" style="margin-top:8px; width:100%;" id="friend-match-btn">🤝 Play vs. a Friend — real two-player quick match</button>
+          <button class="btn btn-ghost" style="margin-top:8px; width:100%;" id="matchmaking-btn">🌐 Quick Match Online — auto-paired by skill</button>
 
           <div class="section-eyebrow" style="margin-top:22px;">FIRST-TEAM SQUAD</div>
           <div class="squad-strip" id="squad-strip"></div>
@@ -2092,6 +2093,119 @@ function connectFriendMatchSockets(matchId, side, token){
 }
 
 document.getElementById('friend-match-btn').addEventListener('click', openFriendMatchModal);
+
+/* ============================================================
+   QUICK MATCH ONLINE — skill-based matchmaking
+   No code to share: POST /matchmaking/join sends your squad, the server
+   computes your level (average starting-XI overall) and adds you to a
+   Redis-backed queue (api/state_backend.py + the matchmaking section of
+   api/match_stream.py), then /ws/matchmaking/{ticket_id} pushes searching
+   status updates every ~1.5s until it pairs you with the closest-level
+   other waiting manager and returns the exact same kickoff shape the
+   Friend Match lobby does — so the live match itself (side tokens, shared
+   simulation, subs, Live Trade) behaves identically either way, via the
+   same beginFriendMatch() used above.
+   ============================================================ */
+let matchmakingTicket = null; // {ticketId, token, ws}
+
+function closeMatchmakingSocket(){
+  if (matchmakingTicket && matchmakingTicket.ws){
+    try { matchmakingTicket.ws.close(); } catch(e){}
+  }
+  matchmakingTicket = null;
+}
+
+function openMatchmakingModal(){
+  if (!LIVE_API_BASE){
+    showToast('Quick Match Online needs a live backend connected — see DEPLOY.md / ?api= param.');
+    return;
+  }
+  const backdrop = document.createElement('div');
+  backdrop.className = 'drawer-backdrop';
+  backdrop.innerHTML = `
+    <div class="drawer">
+      <button class="btn btn-ghost btn-sm drawer-close" id="mm-close">Close</button>
+      <h3>Quick Match Online</h3>
+      <div class="drawer-sub">The server pairs you with whichever other waiting manager currently has the closest starting-XI level — no code to share, no picking who you play.</div>
+      <div id="mm-status" class="offer-terms" style="margin-top:14px;">Searching for an opponent…</div>
+      <button class="btn btn-ghost btn-sm" id="mm-cancel" style="width:100%; margin-top:14px;">Cancel search</button>
+    </div>`;
+  document.body.appendChild(backdrop);
+  const close = () => { closeMatchmakingSocket(); if (document.body.contains(backdrop)) document.body.removeChild(backdrop); };
+  backdrop.querySelector('#mm-close').addEventListener('click', close);
+  backdrop.addEventListener('click', (e) => { if (e.target===backdrop) close(); });
+
+  const statusEl = backdrop.querySelector('#mm-status');
+
+  backdrop.querySelector('#mm-cancel').addEventListener('click', async () => {
+    if (matchmakingTicket){
+      try {
+        await fetch(`${LIVE_API_BASE}/matchmaking/leave?ticket_id=${encodeURIComponent(matchmakingTicket.ticketId)}&token=${encodeURIComponent(matchmakingTicket.token)}`, { method: 'POST' });
+      } catch(e){ /* best-effort — closing the socket below is what actually stops the search either way */ }
+    }
+    close();
+  });
+
+  startMatchmakingSearch(backdrop, statusEl);
+}
+
+async function startMatchmakingSearch(backdrop, statusEl){
+  try {
+    const club = CLUBS.find(c=>c.id===state.club);
+    initLineupIfNeeded();
+    const fullSquad = LEAGUE[state.club];
+    const bench = myLineup.benchIds.map(id => fullSquad.find(p=>p.id===id)).filter(Boolean);
+    const res = await fetch(`${LIVE_API_BASE}/matchmaking/join`, {
+      method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({
+        manager_name: state.managerName, team_name: club.name,
+        squad: myStartingXI().map(toSimplePlayer),
+        bench: bench.map(toSimplePlayer),
+        team_id: state.liveTeamId || null,
+      }),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || 'Could not join matchmaking.');
+
+    matchmakingTicket = { ticketId: data.ticket_id, token: data.token, ws: null };
+    statusEl.innerHTML = `Your level: <b>${data.level}</b> OVR average. Searching for an opponent…`;
+
+    const ws = new WebSocket(`${liveWsBase()}/ws/matchmaking/${data.ticket_id}?token=${encodeURIComponent(data.token)}`);
+    matchmakingTicket.ws = ws;
+    ws.onmessage = (msg) => {
+      const payload = JSON.parse(msg.data);
+      if (payload.type === 'error'){
+        showToast(payload.error || 'Matchmaking error.');
+        return;
+      }
+      if (payload.type === 'searching'){
+        statusEl.innerHTML = `Your level: <b>${data.level}</b> OVR average.<br>` +
+          `Searching… ${Math.round(payload.elapsed)}s elapsed · tolerance ±${payload.tolerance} OVR · ${payload.queue_size} manager${payload.queue_size===1?'':'s'} waiting.`;
+      }
+      if (payload.type === 'cancelled'){
+        showToast('Matchmaking ticket expired — try searching again.');
+        closeMatchmakingSocket();
+        if (document.body.contains(backdrop)) document.body.removeChild(backdrop);
+      }
+      if (payload.type === 'kickoff'){
+        showToast(`Matched with ${payload.opponent_name} (${payload.opponent_level} OVR) — kicking off!`);
+        closeMatchmakingSocket();
+        if (document.body.contains(backdrop)) document.body.removeChild(backdrop);
+        // beginFriendMatch only reads state.friendLobby.opponentName (for
+        // display) — this minimal stand-in is enough to reuse the exact
+        // same live-match setup path the Friend Match lobby uses.
+        state.friendLobby = { opponentName: payload.opponent_name };
+        beginFriendMatch(payload);
+      }
+    };
+    ws.onerror = () => showToast('Matchmaking connection error.');
+  } catch (err){
+    showToast(err.message || 'Could not start matchmaking.');
+    if (document.body.contains(backdrop)) document.body.removeChild(backdrop);
+  }
+}
+
+document.getElementById('matchmaking-btn').addEventListener('click', openMatchmakingModal);
 
 /* ============================================================
    LIVE TRADE — real trade negotiation between the two connected
@@ -4124,7 +4238,7 @@ renderTicker();
 /* ---- PWA: register service worker (no-ops gracefully on file://, older browsers) ---- */
 if ('serviceWorker' in navigator && (location.protocol === 'https:' || location.hostname === 'localhost')) {
   window.addEventListener('load', () => {
-    navigator.serviceWorker.register('./sw.js').catch(() => { /* offline shell unavailable, app still works online */ });
+    navigator.serviceWorker.register('sw.js').catch(() => { /* offline shell unavailable, app still works online */ });
   });
 }
 
