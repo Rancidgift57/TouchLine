@@ -28,7 +28,7 @@ framework, just the handful of primitives match_stream.py actually needs:
 """
 
 from __future__ import annotations
-import redis
+
 import contextlib
 import json
 import os
