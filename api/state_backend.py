@@ -28,7 +28,7 @@ framework, just the handful of primitives match_stream.py actually needs:
 """
 
 from __future__ import annotations
-
+import redis
 import contextlib
 import json
 import os
@@ -200,7 +200,47 @@ async def queue_drain(key: str) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
-# Counters — backs per-side "how many /ws/match connections are currently
+# Sorted set — backs the matchmaking queue (`mm:waiting` in match_stream.py).
+# Members are ticket ids, score is each ticket's `joined_at` timestamp, so
+# `sorted_set_all` naturally returns waiting tickets oldest-first (the order
+# the matchmaking loop wants: someone who's been waiting longest gets first
+# crack at a newly-widened tolerance band). `sorted_set_remove` is the
+# pairing claim primitive — ZREM on multiple members is a single atomic
+# Redis command, so calling it with both {my_ticket_id, candidate_id} and
+# checking the return count == 2 is how two near-simultaneous workers
+# racing to pair the same two tickets resolve without double-booking a
+# match: exactly one caller sees count == 2, everyone else sees a smaller
+# count and backs off. No-op / returns empty when Redis isn't configured,
+# since match_stream.py's local fallback keeps its own in-process dict.
+# ---------------------------------------------------------------------------
+
+async def sorted_set_add(key: str, member: str, score: float) -> None:
+    r = get_redis()
+    if r is None:
+        return
+    await r.zadd(key, {member: score})
+
+
+async def sorted_set_all(key: str) -> list[tuple[str, float]]:
+    r = get_redis()
+    if r is None:
+        return []
+    pairs = await r.zrange(key, 0, -1, withscores=True)
+    return [(member, score) for member, score in pairs]
+
+
+async def sorted_set_remove(key: str, *members: str) -> int:
+    """Atomic multi-member ZREM. Returns how many of `members` were
+    actually present and removed — callers use this as an all-or-nothing
+    claim: a caller only 'wins' a pairing if this equals len(members)."""
+    r = get_redis()
+    if r is None:
+        return 0
+    if not members:
+        return 0
+    return await r.zrem(key, *members)
+
+
 # open for this side" presence tracking (see _side_presence_delta in
 # match_stream.py). Returns None when Redis isn't configured so callers
 # fall back to a local in-process counter, which is authoritative in that
