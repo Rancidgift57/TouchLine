@@ -851,6 +851,259 @@ HALF_TIME_BREAK_SECONDS = 20.0  # real seconds paused server-side at half-time
 DISCONNECT_GRACE_SECONDS = 45.0  # real seconds a friend-match side gets to reconnect before forfeit
 SIM_LOCK_TTL_SECONDS = 900  # generous vs. the ~2-minute compressed match, so it never expires mid-sim
 
+# ---------------------------------------------------------------------------
+# Quick Match Online: skill-based matchmaking.
+#
+# A third way into a real two-player match, alongside the offline solo bot
+# sim and the code-based Friend Match lobby above: no code to share, the
+# server pairs you with whichever other currently-waiting manager has the
+# closest starting-XI level.
+#
+# Cross-worker/cross-region correctness is the whole point here (unlike a
+# single lobby code, which only ever needs to be looked up by the two
+# people who already have it, a shared *queue* is read and mutated by
+# every waiting ticket's socket, on every worker, continuously) — so this
+# is built directly on `api/state_backend`'s Redis primitives rather than
+# the lobby's local-dict-first pattern:
+#   * each ticket's data (squad, level, status, joined_at, kickoff payload
+#     once matched) lives in `mm:ticket:{id}` via kv_set/kv_get, same as a
+#     lobby record.
+#   * `mm:waiting` is a Redis sorted set (ticket_id -> joined_at), so the
+#     matching loop can always read every waiting ticket oldest-first no
+#     matter which worker's socket originally created them.
+#   * pairing two tickets is a single atomic `ZREM mm:waiting a b` — Redis
+#     executes that as one command, so of any number of workers racing to
+#     pair the same two tickets at once, exactly one sees both members
+#     removed (count == 2) and "wins" the right to provision the match;
+#     everyone else sees a smaller count, re-lists itself, and retries.
+# In single-worker/no-Redis mode, `state_backend`'s helpers no-op and the
+# local dict/list below is canonical instead (there's only one worker, so
+# a plain dict is already race-free within one asyncio event loop).
+# ---------------------------------------------------------------------------
+
+_MM_TICKET_TTL_SECONDS = 20 * 60
+_MM_BASE_TOLERANCE = 3.0      # overall-point gap accepted the instant you join
+_MM_GROWTH_PER_SEC = 0.5      # widens by this many points for every second waited
+_MM_MAX_TOLERANCE = 25.0      # never matches wider than this, however long you wait
+_MM_POLL_SECONDS = 1.5
+
+_MM_TICKETS: dict[str, dict] = {}          # local canonical store when Redis is off
+_MM_WAITING_LOCAL: dict[str, float] = {}   # ticket_id -> joined_at, local sorted-set stand-in
+
+
+class MatchmakingJoinRequest(BaseModel):
+    manager_name: str
+    team_name: str
+    squad: list[SimplePlayer]       # starting XI, 11 players — level = their average overall
+    bench: list[SimplePlayer] = []
+    team_id: str | None = None      # logged-in manager's persistent team_id, same as QuickMatchRequest
+
+
+async def _mm_ticket_save(ticket_id: str, ticket: dict) -> None:
+    _MM_TICKETS[ticket_id] = ticket
+    if state_backend.redis_enabled():
+        await state_backend.kv_set(f"mm:ticket:{ticket_id}", ticket, ttl_seconds=_MM_TICKET_TTL_SECONDS)
+
+
+async def _mm_ticket_load(ticket_id: str) -> dict | None:
+    if state_backend.redis_enabled():
+        remote = await state_backend.kv_get(f"mm:ticket:{ticket_id}")
+        if remote is not None:
+            _MM_TICKETS[ticket_id] = remote
+            return remote
+        return None
+    return _MM_TICKETS.get(ticket_id)
+
+
+async def _mm_ticket_delete(ticket_id: str) -> None:
+    _MM_TICKETS.pop(ticket_id, None)
+    await state_backend.kv_delete(f"mm:ticket:{ticket_id}")
+
+
+async def _mm_waiting_add(ticket_id: str, joined_at: float) -> None:
+    if state_backend.redis_enabled():
+        await state_backend.sorted_set_add("mm:waiting", ticket_id, joined_at)
+    else:
+        _MM_WAITING_LOCAL[ticket_id] = joined_at
+
+
+async def _mm_waiting_all() -> list[tuple[str, float]]:
+    """Every currently-waiting ticket, oldest (smallest joined_at) first."""
+    if state_backend.redis_enabled():
+        return await state_backend.sorted_set_all("mm:waiting")
+    return sorted(_MM_WAITING_LOCAL.items(), key=lambda kv: kv[1])
+
+
+async def _mm_waiting_remove(*ticket_ids: str) -> int:
+    """Atomic claim: removes any of `ticket_ids` still present in the
+    waiting set and returns how many actually were. Callers only proceed
+    with a pairing when this equals len(ticket_ids) — anything less means
+    a concurrent worker already claimed one of the two tickets first."""
+    if state_backend.redis_enabled():
+        return await state_backend.sorted_set_remove("mm:waiting", *ticket_ids)
+    removed = 0
+    for tid in ticket_ids:
+        if _MM_WAITING_LOCAL.pop(tid, None) is not None:
+            removed += 1
+    return removed
+
+
+def _mm_tolerance(waited_seconds: float) -> float:
+    return min(_MM_BASE_TOLERANCE + _MM_GROWTH_PER_SEC * max(waited_seconds, 0), _MM_MAX_TOLERANCE)
+
+
+@app.post("/matchmaking/join")
+async def matchmaking_join(req: MatchmakingJoinRequest) -> dict:
+    if len(req.squad) != 11:
+        return JSONResponse(status_code=400, content={"error": "squad must have exactly 11 players."})
+
+    ticket_id = str(uuid.uuid4())
+    token = secrets.token_urlsafe(18)
+    level = sum(p.overall for p in req.squad) / len(req.squad)
+    joined_at = time.time()
+
+    ticket = {
+        "ticket_id": ticket_id, "token": token, "status": "waiting", "joined_at": joined_at,
+        "manager_name": req.manager_name, "team_name": req.team_name, "level": level,
+        "squad": [p.model_dump() for p in req.squad], "bench": [p.model_dump() for p in req.bench],
+        "team_id": req.team_id, "kickoff": None,
+    }
+    await _mm_ticket_save(ticket_id, ticket)
+    await _mm_waiting_add(ticket_id, joined_at)
+
+    return {"ticket_id": ticket_id, "token": token, "level": round(level, 1)}
+
+
+@app.post("/matchmaking/leave")
+async def matchmaking_leave(ticket_id: str, token: str) -> dict:
+    ticket = await _mm_ticket_load(ticket_id)
+    if ticket is None:
+        return {"ok": True}  # already gone — nothing to do
+    if ticket["token"] != token:
+        return JSONResponse(status_code=403, content={"error": "Invalid matchmaking token."})
+    if ticket["status"] == "matched":
+        # A pairing that lands in the same instant as a cancel just
+        # proceeds — there's no way to un-pair once both sides have been
+        # provisioned, so this reports that instead of silently no-op'ing.
+        return JSONResponse(status_code=409, content={"error": "Already matched.", "kickoff": ticket["kickoff"]})
+    await _mm_waiting_remove(ticket_id)
+    await _mm_ticket_delete(ticket_id)
+    return {"ok": True}
+
+
+def _mm_kickoff_payload(side: str, token: str, result: dict, opponent: dict) -> dict:
+    return {
+        "type": "kickoff", "match_id": result["match_id"],
+        "home_team_id": result["home_team_id"], "away_team_id": result["away_team_id"],
+        "home_player_map": result["home_player_map"], "away_player_map": result["away_player_map"],
+        "your_side": side, "your_token": token,
+        "opponent_name": opponent["manager_name"], "opponent_level": round(opponent["level"], 1),
+    }
+
+
+async def _mm_try_pair(ticket_id: str, ticket: dict) -> dict | None:
+    """One matching attempt for `ticket_id`. Returns the kickoff payload
+    for THIS ticket if it just won a pairing, else None (caller keeps
+    polling). Mutates nothing about the other ticket unless the atomic
+    ZREM claim on both succeeds."""
+    now = time.time()
+    my_tolerance = _mm_tolerance(now - ticket["joined_at"])
+
+    for cand_id, cand_joined_at in await _mm_waiting_all():
+        if cand_id == ticket_id:
+            continue
+        candidate = await _mm_ticket_load(cand_id)
+        if candidate is None or candidate.get("status") != "waiting":
+            continue
+        cand_tolerance = _mm_tolerance(now - candidate["joined_at"])
+        gap = abs(ticket["level"] - candidate["level"])
+        # Accepted once the gap is within the WIDER of either side's own
+        # tolerance — so a ticket that's been waiting a long time can pull
+        # in a fresh arrival even before that arrival's own band has had
+        # time to widen.
+        if gap > max(my_tolerance, cand_tolerance):
+            continue
+
+        claimed = await _mm_waiting_remove(ticket_id, cand_id)
+        if claimed != 2:
+            # Lost the race for one of the two tickets (someone else
+            # paired with us, or with the candidate, in the meantime).
+            # Re-list ourselves at our original join time and let the
+            # caller re-check status / retry on the next poll — safe even
+            # if we were never actually removed, since re-adding the same
+            # member just refreshes its score.
+            await _mm_waiting_add(ticket_id, ticket["joined_at"])
+            # If someone else just matched US, our own record will show
+            # status == "matched" on the next reload; nothing more to do
+            # here either way.
+            return None
+
+        client = get_client()
+        result = await _provision_and_create_match(
+            client, ticket["team_name"], [SimplePlayer(**p) for p in ticket["squad"]],
+            [SimplePlayer(**p) for p in ticket["bench"]],
+            candidate["team_name"], [SimplePlayer(**p) for p in candidate["squad"]],
+            [SimplePlayer(**p) for p in candidate["bench"]],
+            ticket.get("team_id"), candidate.get("team_id"),
+        )
+        home_token, away_token = secrets.token_urlsafe(18), secrets.token_urlsafe(18)
+        await _set_side_tokens(result["match_id"], {"home": home_token, "away": away_token})
+
+        ticket["status"] = "matched"
+        ticket["kickoff"] = _mm_kickoff_payload("home", home_token, result, candidate)
+        candidate["status"] = "matched"
+        candidate["kickoff"] = _mm_kickoff_payload("away", away_token, result, ticket)
+        await _mm_ticket_save(ticket_id, ticket)
+        await _mm_ticket_save(cand_id, candidate)
+        return ticket["kickoff"]
+
+    return None
+
+
+@app.websocket("/ws/matchmaking/{ticket_id}")
+async def matchmaking_socket(websocket: WebSocket, ticket_id: str, token: str | None = None):
+    """Repeatedly attempts to pair `ticket_id` with the closest-level other
+    waiting manager, pushing a `searching` status update every ~1.5s until
+    a `kickoff` (or `cancelled`) message ends the loop. Safe to have many
+    of these open across many workers at once — see the module docstring
+    above for how the Redis-backed queue keeps that race-free."""
+    await websocket.accept()
+    ticket = await _mm_ticket_load(ticket_id)
+    if ticket is None or token != ticket.get("token"):
+        await websocket.send_json({"type": "error", "error": "Matchmaking ticket not found."})
+        await websocket.close(code=4404)
+        return
+
+    try:
+        while True:
+            ticket = await _mm_ticket_load(ticket_id)
+            if ticket is None:
+                await websocket.send_json({"type": "cancelled"})
+                return
+            if ticket["status"] == "matched":
+                await websocket.send_json(ticket["kickoff"])
+                return
+
+            kickoff = await _mm_try_pair(ticket_id, ticket)
+            if kickoff is not None:
+                await websocket.send_json(kickoff)
+                return
+
+            waiting = await _mm_waiting_all()
+            elapsed = time.time() - ticket["joined_at"]
+            await websocket.send_json({
+                "type": "searching", "elapsed": round(elapsed, 1),
+                "tolerance": round(_mm_tolerance(elapsed), 1), "queue_size": len(waiting),
+            })
+            await asyncio.sleep(_MM_POLL_SECONDS)
+    except WebSocketDisconnect:
+        # Mirrors the friend-match lobby's disconnect handling: a closed
+        # socket just stops polling. The ticket (and its `mm:waiting`
+        # entry) is left in place with its TTL so a client that reconnects
+        # to the same ticket_id/token resumes the same queue position —
+        # explicit cancellation is what POST /matchmaking/leave is for.
+        pass
+
 # One live-substitution queue per in-flight match, shared between the two
 # websocket handlers below (`stream_match` reads it, `receive_tactics`
 # writes to it). Local-dict-with-Redis-mirror, same pattern as the lobby
